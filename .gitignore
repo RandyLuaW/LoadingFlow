@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+out/
+dist/
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+CMakeUserPresets.json
+compile_commands.json
+
+# Third-party header that must not be vendored
+include/SKSEMenuFramework.h
+include/SKSEMenuFramework.h.bak
+
+# Local snapshots / backups / scratch
+_snapshots/
+*.bak
+*.tmp
+*.zip
+*.log

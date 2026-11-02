@@ -1,0 +1,78 @@
+LoadingFlow — Source-Available License (All Rights Reserved)
+Version 1.0
+
+Copyright (c) 2026 RandyLuaW (GitHub: @RandyLuaW). All rights reserved.
+
+This repository is published for ONE purpose: letting people read and audit the code.
+It is NOT open source. It is NOT free software. It is source-available for review only.
+
+1. PERMITTED WITHOUT ANY FURTHER PERMISSION
+   a. You may read the source code, including cloning or downloading it for the purpose of
+      reading, studying, or auditing it.
+   b. You may quote short excerpts in bug reports, security reviews, discussions, or articles,
+      provided the source and the official repository URL are credited.
+   c. You may run the pre-built binary distributed through this repository's Releases page for
+      your own personal, non-commercial use with your own copy of the game.
+
+2. NOT PERMITTED
+   Except with prior written permission from the copyright holder, you may NOT:
+   a. modify, adapt, translate, or create derivative works of the source code;
+   b. redistribute, publish, sublicense, sell, rent, lease, or otherwise make the source code or
+      any binary built from it available to third parties, in whole or in part;
+   c. include the source code or any binary built from it in any mod pack, compilation, installer,
+      paid product, or hosted service;
+   d. create public forks, mirrors, or re-uploads of this repository;
+   e. remove, obscure, or alter any copyright notice, this license, or any attribution;
+   f. use the project name "LoadingFlow" or the author's name in any way that suggests endorsement
+      or affiliation without prior written permission.
+
+3. NO SOURCE CODE IS SUPPLIED FOR REBUILDING REDISTRIBUTABLE ARTIFACTS
+   Building the code is permitted only for private study. Any binary you build yourself is subject
+   to clause 2 and may not be distributed.
+
+4. THIRD-PARTY COMPONENTS
+   This project links against third-party components that keep their own licenses. See
+   THIRD-PARTY-NOTICES.txt. This license does not alter those licenses.
+
+5. NO WARRANTY
+   THE SOFTWARE AND SOURCE CODE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+   PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM,
+   DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+6. NO TRADEMARK OR PATENT LICENSE
+   No trademark rights and no patent license are granted. All rights not expressly granted are
+   reserved.
+
+7. TERMINATION
+   Any breach of this license terminates all rights granted to you immediately. Sections 2, 4, 5,
+   6 and 8 survive termination.
+
+8. GOVERNING CLAUSE
+   If any provision is held unenforceable, the remaining provisions remain in full force.
+
+-------------------------------------------------------------------------------
+中文对照（仅供参考，以英文正文为准）
+
+LoadingFlow — 源码公开许可（保留所有权利）版本 1.0
+
+本仓库只为一个目的公开：**让人阅读与审计代码**。它**不是开源软件**，**不是自由软件**，
+而是"源码公开、仅供审阅"。
+
+允许：阅读/克隆以下载用于阅读与审计；在问题报告、安全评审、讨论或文章中引用短片段（须注明
+出处与本仓库链接）；通过本仓库 Releases 下载的现成二进制，可用于自己持有的游戏、个人非商业
+用途。
+
+禁止（须事先获得版权持有人书面许可）：修改、改编、翻译或创作衍生作品；再分发、发布、再许可、
+出售、出租源码或用其构建的任何二进制；把源码或其二进制打包进整合包、安装器、付费产品或托管
+服务；建立公开分叉、镜像或重新上传本仓库；删除或修改版权声明与本许可；以暗示背书或关联的方式
+使用项目名或作者名。
+
+自行构建仅限私人研习，所构建的二进制同样受禁止条款约束，不得分发。
+
+第三方组件各自保留其许可（见 THIRD-PARTY-NOTICES.txt），本许可不改变之。
+
+无担保；不授予商标权与专利许可；未明确授予的权利一律保留；违约即终止授权。
+
+以英文正文为准。
