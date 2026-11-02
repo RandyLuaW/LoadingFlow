@@ -102,7 +102,8 @@ Output: `build/Release/LoadingFlow.dll`.
 Install the FOMOD from the release channel. It asks two things: which game runtime you are on
 (SE 1.5.97 + AE 1.6.x, or AE 1.7.x experimental), and whether you want the Chinese language pack.
 
-Remove any previous copy of this plugin first — two DLLs would hook the same engine function twice.
+If you already have an older or development build of this plugin, remove it first — two DLLs would
+hook the same engine function twice.
 
 ---
 
