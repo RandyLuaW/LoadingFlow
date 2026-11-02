@@ -79,9 +79,19 @@ cmake --build build --config Release
 
 ## 许可
 
-**源码公开仅供审计，保留所有权利**：不授予修改、衍生、再分发、商用权利，也不允许建立公开
-分叉或重新上传。详见 [LICENSE](./LICENSE)。第三方组件许可见
-[THIRD-PARTY-NOTICES.txt](./THIRD-PARTY-NOTICES.txt)。
+**双许可**（与发布渠道一致）：
+
+1. **默认：源码公开仅供审计，保留所有权利** —— 不授予修改、衍生、再分发、商用权利，也不允许
+   建立公开分叉或重新上传。详见 [LICENSE](./LICENSE)。
+2. **替代选项：GNU GPL v3.0** —— 你可以选择按 GPL-3.0 使用本作品，全文见
+   [LICENSE-GPL-3.0](./LICENSE-GPL-3.0)。
+
+**为什么需要第二个选项**：通过官方渠道分发的**预编译插件包含可选的内置菜单**，它链接了
+[SKSE Menu Framework 3](https://github.com/QTR-Modding/SKSE-Menu-Framework-3)（GPL-3.0）。
+因此该二进制的分发只能依 GPL-3.0 进行，预编译二进制**仅按 GPL-3.0 选项**提供。以
+`-DWITH_MENU=OFF` 构建的版本不含 GPL-3.0 代码，只受上述默认条款约束。
+
+第三方组件许可见 [THIRD-PARTY-NOTICES.txt](./THIRD-PARTY-NOTICES.txt)。
 
 ## 免责
 

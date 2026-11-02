@@ -32,8 +32,11 @@ by this repository's own license (see LICENSE).
    Types and addresses are described by CommonLibSSE-NG. No Bethesda code, assets, or data files
    are redistributed by this repository.
 
-OPTIONAL, NOT VENDORED: SKSE Menu Framework 3
+4. SKSE Menu Framework 3  —  GNU GPL v3.0
    https://github.com/QTR-Modding/SKSE-Menu-Framework-3
    The in-game settings menu is an optional build feature (CMake option WITH_MENU). The upstream
-   header is deliberately NOT included in this repository; obtain it from its own project and
-   respect its license.
+   header is deliberately NOT included in this repository; obtain it from its own project.
+   IMPORTANT: the pre-built plugin distributed through the official channels is built WITH the
+   menu, therefore that binary links GPL-3.0 code and is distributed under the GPL-3.0 option of
+   this project's dual license (see LICENSE). Builds made with -DWITH_MENU=OFF contain no GPL-3.0
+   code.
