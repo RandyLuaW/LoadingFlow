@@ -62,6 +62,42 @@ Read this before installing, so your expectations match reality.
 
 ---
 
+## Why this is as far as it goes
+
+This plugin was built for one reason: to give players a seamless loading experience when they walk
+through doors. It is not literally seamless — the load still happens — but everything a plugin can
+reach has been taken.
+
+**What the SKSE plugin layer can do — and all of it is done here:**
+
+| Lever | Result |
+|---|---|
+| Remove the loading menu | Gone entirely on door transitions |
+| Pre-load wait | 1002–1022 ms → 694–734 ms (a set of engine timers, now at their floor) |
+| Post-load wait | `fPostLoadUpdateTimeMS` 2000 → 100 ms |
+| Model I/O spreading | Pre-warming; measured neutral, kept because it is free |
+
+**What it cannot do:** the real load — scripting, cell data, actor placement — takes seconds on a
+heavily modded setup. A plugin cannot compress it, because it is not waiting, it is work.
+
+**Why the engine cannot go further:**
+
+| Creation Engine | A seamless-world game |
+|---|---|
+| Discrete cells, loaded atomically — all of a cell, or none of it | Continuous space, streamed |
+| Interiors in cell-local coordinates, exteriors in world coordinates; one coordinate system rendered at a time | One shared world coordinate system |
+| Doors perform a discrete teleport | Movement is continuous; corridors hide the load |
+
+Every approach that looks seamless has to pay with one of three things: game-logic integrity (NPCs
+popping in, scripts pointing at the wrong cell, quests breaking), visual continuity (freeze, black
+screen, stutter), or stability (preloading doubling memory, save loads hanging). This plugin refuses
+those trades; the only price it pays is that the engine's own scene assembly stays visible for a
+moment at the swap point.
+
+Going genuinely seamless would mean rewriting the cell manager, the renderer, the level layout and
+the core systems — engine-remake scale work that would also break thousands of existing mods. Within
+the engine as it ships, this is the endpoint.
+
 ## Measured numbers
 
 Same door pair, full restart before each group:
