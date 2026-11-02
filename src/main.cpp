@@ -3143,7 +3143,7 @@ namespace
 SKSEPluginInfo(
     .Version = REL::Version{ 1, 0, 0, 0 },
     .Name = "LoadingFlow"sv,
-    .Author = "RandyLuaW"sv,
+    .Author = "RandyLua"sv,
     .SupportEmail = ""sv,
     .StructCompatibility = SKSE::StructCompatibility::Independent,
     .RuntimeCompatibility = SKSE::VersionIndependence::AddressLibrary,
