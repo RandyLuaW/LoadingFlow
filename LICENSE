@@ -11,8 +11,6 @@ It is NOT open source. It is NOT free software. It is source-available for revie
       reading, studying, or auditing it.
    b. You may quote short excerpts in bug reports, security reviews, discussions, or articles,
       provided the source and the official repository URL are credited.
-   c. You may run the pre-built binary distributed through this repository's Releases page for
-      your own personal, non-commercial use with your own copy of the game.
 
 2. NOT PERMITTED
    Except with prior written permission from the copyright holder, you may NOT:
@@ -61,8 +59,7 @@ LoadingFlow — 源码公开许可（保留所有权利）版本 1.0
 而是"源码公开、仅供审阅"。
 
 允许：阅读/克隆以下载用于阅读与审计；在问题报告、安全评审、讨论或文章中引用短片段（须注明
-出处与本仓库链接）；通过本仓库 Releases 下载的现成二进制，可用于自己持有的游戏、个人非商业
-用途。
+出处与本仓库链接）。本仓库不分发预编译二进制。
 
 禁止（须事先获得版权持有人书面许可）：修改、改编、翻译或创作衍生作品；再分发、发布、再许可、
 出售、出租源码或用其构建的任何二进制；把源码或其二进制打包进整合包、安装器、付费产品或托管
