@@ -24,7 +24,7 @@ pathing, NPCs, combat, encounters and quest events behave exactly as they do wit
 | Module | How it works | What you get |
 |---|---|---|
 | **Loading screen removal** | Hooks `LoadingMenu::ProcessMessage` and answers the engine's `kShow` / `kReshow` requests with `kIgnore` | The loading menu is never created on door transitions. Fast travel and save loading keep their normal vanilla loading screens. |
-| **Transition timer trimming** | Rewrites registered INI setting values at runtime: `fFadeToBlackFadeSeconds`, `fNormalDoorFadeSecs`, `fMinSecondsForLoadFadeIn`, `fPostLoadUpdateTimeMS` and related keys | The pre-load wait after pressing E drops from the stock **1002–1022 ms** to **694–734 ms** (variance under 5%). `fPostLoadUpdateTimeMS` goes from this machine's **2000 ms** to **100 ms**. |
+| **Transition timer trimming** | Rewrites registered INI setting values at runtime: `fFadeToBlackFadeSeconds`, `fNormalDoorFadeSecs`, `fMinSecondsForLoadFadeIn`, `fPostLoadUpdateTimeMS` and related keys | The pre-load wait after pressing E drops from the stock **1002–1022 ms** to **694–734 ms** (variance under 5%). `fPostLoadUpdateTimeMS` drops from **2000 ms** to **100 ms**. |
 | **Model pre-warming** (optional) | When you approach a load door, calls `BSModelDB::Demand` on the destination cell's models, budgeted to 8 ms per slice | Model I/O is spread over the walk to the door instead of all landing on the doorpress. Measured effect on total load time: neutral. |
 | **Per-phase timing log** | Records timestamps at three points: pressing E → the engine requesting the menu → the cell swap completing | Emits the total `N` plus the pre-load and load phases separately, so the bottleneck is measurable instead of guessed. |
 
@@ -48,10 +48,9 @@ pathing, NPCs, combat, encounters and quest events behave exactly as they do wit
 
 Read this before installing, so your expectations match reality.
 
-- **It does not make loading instant.** On the machine this was developed and measured on (about
-  3,800 plugins), the real load between the engine requesting the menu and the cell swap finishing
-  still takes **1019–2577 ms**. That is the physical cost of that load order; a plugin cannot
-  compress it.
+- **It does not make loading instant.** On a heavily modded setup, the real load between the
+  engine requesting the menu and the cell swap finishing still takes on the order of seconds. That
+  is the physical cost of the load order itself; a plugin cannot compress it.
 - **It does not hide the scene assembly at the swap.** The engine briefly spins and scales the new
   scene into place. Only a black screen could cover that, and a black screen conflicts with "see the
   room immediately", which is what this plugin chooses.
@@ -70,8 +69,8 @@ Same door pair, full restart before each group:
 | Phase | Before | After |
 |---|---|---|
 | Press E → engine requests the loading menu | 1002–1022 ms (stock `fFadeToBlackFadeSeconds` = 1.0) | **694–734 ms** |
-| Engine requests menu → cell swap done | — | 1019–2577 ms (workload-bound, not compressible here) |
-| `fPostLoadUpdateTimeMS` | **2000 ms** on this machine | **100 ms** |
+| Engine requests menu → cell swap done | — | seconds, workload-bound — not compressible here |
+| `fPostLoadUpdateTimeMS` | **2000 ms** (stock) | **100 ms** |
 
 Do not compare successive visits to the same door: the load phase falls every time the files are
 already in the OS cache. Only the first transition of a run, or the same position across two runs,

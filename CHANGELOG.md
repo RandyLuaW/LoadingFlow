@@ -28,8 +28,8 @@ distribution was reworked around what the plugin actually does today.
 
 - It does not copy cells, replace interiors, or intercept the teleport. Every transition is the
   engine's own, so pathing, NPCs, combat and quest events stay vanilla.
-- It does not shorten the load itself. Measured on a ~3,800-plugin setup: the real load remains
-  1.0–2.6 s.
+- It does not shorten the load itself. On a heavily modded setup the real load remains on the
+  order of seconds.
 - It does not hide the engine's scene-attach spin at the swap point.
 - It does not touch teleports implemented by activators, scripts or trigger volumes by default.
 
