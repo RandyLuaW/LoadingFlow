@@ -30,6 +30,22 @@ pathing, NPCs, combat, encounters and quest events behave exactly as they do wit
 
 ---
 
+## In-game menu
+
+The optional settings menu (built with `-DWITH_MENU=ON`, needs SKSE Menu Framework 3) is where the
+plugin is configured. Presets and the individual controls write the same settings, so a preset is a
+starting point you can fine-tune. **Every switch applies to the next door; nothing needs a restart.**
+
+| Section | What it offers |
+|---|---|
+| Core switches | master enable, loading-menu suppression, model pre-warming, freeze delay, cut mask |
+| Presets (one click) | Conservative / Recommended |
+| Speed vs stability **(new in 1.2.0)** | Stable (the game's own timer values) / Balanced / Fastest, plus a slider per value; applies immediately |
+
+The engine timers decide how much time scripts and other mods get after a cell change, not how the
+transition looks. If placed clutter looks scattered or a script-driven mod misbehaves after doors,
+switch to Stable first. Every diagnostic switch ships **off**.
+
 ## Design principles
 
 - **The real cell transition is kept.** Nothing is copied, no level data is edited, no teleport is
@@ -64,9 +80,9 @@ Read this before installing, so your expectations match reality.
 
 ## Why this is as far as it goes
 
-This plugin was built for one reason: to give players a seamless loading experience when they walk
-through doors. It is not literally seamless — the load still happens — but everything a plugin can
-reach has been taken.
+This plugin was built for one reason: to make walking through a door feel fast. It is not seamless
+loading — the load still happens — but everything a plugin can reach has been taken: the screen is
+gone, and the engine's transition timers are down to their floor.
 
 **What the SKSE plugin layer can do — and all of it is done here:**
 

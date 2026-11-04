@@ -5,6 +5,70 @@ The project was called **PocketCell** until v1.0.0; that name is retired.
 
 ---
 
+## [1.2.0] — 2026-11-05
+
+### Fixed
+
+- **The loading screen could reappear after a transition and lock all input.** The plugin stopped
+  intercepting the Loading Menu the moment the cell change completed; the engine can ask for that
+  menu slightly later, and that late request went through. The vanilla loading screen then sat on top
+  of a playable game and nothing ever closed it — ESC and the console were gone while SKSE's own menu
+  still worked. Late requests are now ignored for a grace window after the transition, and the
+  loading menu is force-closed if it is ever found open.
+- The transition counter in the menu counts real transitions again (it only counted the retired
+  pocket-copy path before).
+- The engine's cut-point black fade is gone. It was ours, a leftover from an old route, and it fired
+  on every single door.
+
+### Added
+
+- **Speed vs stability presets** in the in-game menu: Stable (the game's own timer values), Balanced,
+  Fastest (what 1.1.0 shipped), plus a slider per value. Applying takes effect immediately.
+- `[Perf]` log line: frames and hitches in the 3 seconds after a transition, so stutter can be
+  measured instead of guessed.
+
+### Changed
+
+- The plugin, the menu and the docs no longer describe the mod as "seamless". Loading still happens;
+  what is removed is the screen and part of the engine's transition timers.
+- Default `fPostLoadUpdateTimeMS` is 800 (Balanced) instead of 100, and
+  `iLoadingQueuedPriorityBudgetMs` is back to the vanilla 20.
+
+### Removed
+
+- The experimental swap-point modes (freeze, black envelope, freeze frame), the short cover and the
+  void effect, together with their menu entries and INI keys. On heavily modded setups they never
+  reached the screen.
+- Menu entries that belonged to the retired pocket-copy route.
+
+---
+
+## [1.1.0] — 2026-11-03
+
+### Added
+
+- **In-game settings menu.** One-click presets (Conservative / Recommended) plus the individual
+  control for every setting a preset writes, so a preset is a starting point rather than a mode.
+  Changes apply to the next door; nothing needs a restart.
+- **Experimental visual transition switches**: four long-cover modes, a cover limited to the swap
+  point (capped at 350 ms in code), and a "void effect" that fills the load window instead of
+  treating it as something to cover.
+- Read-only diagnostic switches for the renderer reachability, the transition timeline and the
+  Present hook chain.
+
+### Changed
+
+- Every visual switch defaults to **off**, and every diagnostic switch defaults to off in release
+  builds. Untouched, the plugin behaves exactly as in 1.0.0.
+
+### Notes
+
+- The visual modes are experiments. None of them was judged better than the plain hard cut, which
+  is why none of them is a default. See "Known boundaries" for the measured timeline that
+  motivates the 350 ms cap.
+
+---
+
 ## [1.0.0] — 2026-11-03
 
 First public release. The plugin was renamed from PocketCell to LoadingFlow and the whole
