@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -40,6 +42,13 @@
 #include <dxgi1_2.h>
 
 #include "VoidOverlayShader.h"
+
+// Banner shown in the log's first line. Bump this together with the release version --
+// the packaging script asserts on it, and "How to verify it is working" tells users to
+// check exactly this string.
+#ifndef LOADINGFLOW_BANNER
+#define LOADINGFLOW_BANNER "1.3.5"
+#endif
 
 namespace logger = SKSE::log;
 using namespace std::literals;
@@ -81,13 +90,19 @@ namespace
         // (zero I/O, but no navmesh and no NPCs -- kept only for A/B experiments).
         bool          usePocketCopies = false;
         bool          suppressLoadingMenu = true;
-        std::uint32_t suppressTimeoutMs = 400;
+        std::uint32_t suppressTimeoutMs = 6000;   // v1.3.4d: was 400; the INI template always said 6000, so deleting the key silently changed behaviour
         // How long after the door activation we still treat a LoadingMenu request as belonging to
         // THIS transition. Measured in-game: the engine requests the menu 0.6-1.0 s after Activate
         // (it fades and starts the load first), so a 400 ms window expired before the menu was even
         // asked for. suppressTimeoutMs keeps its own meaning: after we HAVE suppressed, how long we
         // wait for the swap before re-posting the menu.
-        std::uint32_t transitionWindowMs = 10000;
+        // v1.3.4: a CAP, not a wait -- a fast door ends the moment the cell changes, so raising
+        // this costs nothing on normal setups and stops heavy cells being abandoned 1.8 s early
+        // (measured: 11839 ms load vs the old 10000 ms cap).
+        std::uint32_t transitionWindowMs = 30000;
+        // Tracks whether uTransitionWindowMs was explicitly set in LoadingFlow.ini; when false,
+        // adaptive per-cell windows apply and SaveConfig leaves uTransitionWindowMs commented out.
+        bool          transitionWindowPinned = false;
         // Tier 3: proximity pre-warm. While walking around, demand the models of interiors that are
         // routed to a real transition, so the actual load finds them already in the model DB.
         bool          prewarmNearbyDoors = true;
@@ -111,7 +126,7 @@ namespace
         // Policy: freeze-frame only makes sense for BUILDING doors. Cave/mine entrances are already
         // dark inside, so holding the last frame there buys nothing and reads as a still image --
         // those keep the normal fade. 1 (default) = apply no-black only to manual doors.
-        bool          noBlackOnlyForManualDoors = true;
+        bool          noBlackOnlyForManualDoors = false;   // v1.3.0: default OFF (see INI note)
         // Cut mask: a brief effect fired exactly at the moment the cell swap lands, to hide the hard
         // cut from "door half open" to "inside". It is NOT the long black screen -- default 80 ms,
         // and the record is swappable (black family, FadeToWhite 0x0010100B, blur 0x000B97F7,
@@ -122,8 +137,8 @@ namespace
         // lines in one 3-minute session), so this stays off unless explicitly requested.
         bool          logDoorActivations = false;
         // Adaptive fallback. 0 = always suppress. When > 0, a cell whose last measured load took
-        // longer than this shows the vanilla loading menu instead of 2 s of black: on this modlist
-        // interior loads measure 1884-3269 ms, which is too long to hide.
+        // longer than this shows the vanilla loading menu instead of 2 s of black: on a heavily modded
+        // setup interior loads can measure 1884-3269 ms, which is too long to hide.
         std::uint32_t suppressMaxMs = 0;
         // Adaptive freeze guard. Freezing only works while the load is short; once a cell has
         // been measured as slower than this, that cell uses the fade instead. 0 = never veto freeze.
@@ -150,7 +165,7 @@ namespace
         // v1.6.4: default goes back to the v1.1.0 published value. One machine showing no difference
         // is NOT evidence that it makes no difference everywhere -- that inference was over-reach.
         // The menu now carries the trade-off (Stable restores the game's own values).
-        float postLoadUpdateTimeMS = 100.0f;     // vanilla 500, but THIS MACHINE ships 2000 in
+        float postLoadUpdateTimeMS = 100.0f;     // vanilla 500, but the author's INI ships 2000 in
                                                  // Skyrim.ini [Papyrus] -- 2 s of pure waiting that
                                                  // happens AFTER the cell change, i.e. outside our
                                                  // own N measurement. -1 = leave alone.
@@ -180,7 +195,7 @@ namespace
         // auto/frameless doors with a CONTINUOUS scene on both sides, so freezing on the last frame
         // shows no loading screen -- that is what Interiors->Interior transit gets here. Ext->Int (cave
         // mouth from outside) still uses the normal fade.
-        bool          noBlackForWalkThrough = true;
+        bool          noBlackForWalkThrough = false;      // v1.3.0: default OFF (see INI note)
         // Global mode: suppress the LoadingMenu even when LoadingFlow's own door hook was not what
         // started the transition (trigger volumes, script MoveTo, anything else). Long loads fall
         // back automatically because the timeout re-posts the menu -- which is exactly what keeps
@@ -265,15 +280,93 @@ namespace
         // The ugliest part is the engine spinning the new cell into place AFTER the cell change
         // (~21 frames measured: radial smearing + a brightness spike). Instead of an additive pulse,
         // keep the last frame of the old cell and dissolve it into the finished one. A 1:1 blit means
-        // the HUD is not distorted. The length is capped at 350 ms: the engine's scene assembly is about that long.
+        // the HUD is not distorted. The length is capped at 350 ms by the user's rule.
+        // v1.2.3-exp: 0 = do not touch the loading menu, 1 = suppress it (drop kShow), 2 = let it open
+        // and only hide its visuals. Mode 2 keeps kPausesGame (the game stays paused during the load)
+        // and the engine's own loading state machine -- both of which modes 0/1 lose or bypass.
+        // -1 = follow the legacy bSuppressLoadingMenu boolean.
+        int           suppressMode = -1;
         bool          crossFade = true;
         // v1.4.13 diagnostic: lift the WHOLE screen additively during the dead window. If the picture
         // visibly brightens, our Present-layer drawing reaches the display; if it does not, nothing we
         // draw at Present time is being presented and the route has to change (UI/Scaleform instead).
         bool          overlayDebugFullscreen = false;
         // v1.5.5: how long to withhold Present at the cut so the engine's empty frames never show.
-        std::uint32_t holdAtCutMs = 250;   // SAFETY CAP; the gate releases on its own (v1.5.6)
+        // v1.3.2: SAFETY CAP for holding the last frame after the cut. 0 = OFF (no freeze at all).
+        std::uint32_t holdAtCutMs = 250;
         std::uint32_t crossFadeMs = 350;
+        // v1.9.0: how much of that 350 ms is spent simply HOLDING the snapshot before the dissolve
+        // starts. A straight dissolve between the dark frozen old cell and a much brighter new one
+        // reads as a bright flash; holding first covers the assembly and gives the eye an anchor.
+        std::uint32_t crossFadeHoldMs = 3000;
+        // ---- v1.3.0 frozen-frame pass ("the picture keeps moving") -----------------------------
+        // The dead window is ONE still picture. Nothing darkens it (that route is dead), nothing
+        // covers it -- instead the picture we already have is re-sampled with a slowly growing
+        // scale, so every pixel changes a little every frame. That reads as motion, which is
+        // exactly what the window is missing, and it costs one texture copy.
+        //   iVisualMode 0 = the Present hook draws nothing at all (v1.2.1 behaviour) -- DEFAULT, so a
+        //                   public build is byte-for-byte the same product as before
+        //               1 = dead-window push-in + cut cross-fade          (experimental build)
+        //               2 = cut cross-fade only (push-in disabled)
+        //               3 = PROBE: fill the whole target magenta for a few frames. One glance tells
+        //                   us whether anything we draw at Present time reaches the display; if it
+        //                   does not, the whole Present layer is a dead end and only a Fader/Mist
+        //                   presentation takeover is left.
+        int   visualMode = 0;
+        // v1.3.4: submitting through slot 22 reaches the screen (proven: 90 frames of magenta),
+        // v1.3.4: slot 22's downstream can be sl.interposer.dll -- NVIDIA Streamline, i.e.
+        // DLSS frame generation. While the picture is static that path is idle and the bypass works
+        // for hundreds of frames; the moment the scene actually moves (the cut) frame generation
+        // engages and needs its own present sequence, and bypassing it wedges the whole chain
+        // (observed: frozen picture, then the render collapsing into the top-left corner at a few
+        // seconds per frame). So the bypass is OFF by default: stable, no visual effect.
+        // Turn it on only with DLSS Frame Generation disabled in the game/driver.
+        bool  usePresent1ForVisual = false;
+        // v1.8.7: v1.8.4 hedged one path against every single door and lost. The split below is
+        // still worth having, but the recommendation has since flipped: the module that swallowed
+        // our pixels on slot 8 was DebugMod, and it is now disabled, so the normal chain is the
+        // route to test. Slot 22 reaches the screen but its downstream is sl.interposer.dll (NVIDIA
+        // Streamline / DLSS frame generation) and using it is confirmed to fight frame generation.
+        //   0 = never bypass (slot 8 only) -- DEFAULT, and the one to measure against now
+        //   1 = bypass only while the dead window is static, back to slot 8 the instant the cut
+        //       fires -- comparison only, not a shipping route
+        //   2 = bypass on every drawn frame, cut included (the v1.8.4 route: freezes at the cut)
+        int   submitRoute = 0;
+        // v1.8.7: the measurement nine rounds of diagnosis never made. Ask DXGI whether the Present
+        // we handed to the chain below us was counted at all. `Present returned 0x00000000` only
+        // ever proved that the function we called did not report an error -- and three return-0
+        // paths in this very file return S_OK without presenting anything.
+        bool  presentAudit = false;
+        // v1.10.0: the push-in is OFF by default. The user tried it in game and judged the look bad
+        // -- the frozen picture moving towards the camera reads as a lurch. The effect is now a
+        // gradual loss of focus (frosted glass), which keeps the frame still. The knob stays so the
+        // push-in can still be dialled in from the menu without a rebuild.
+        float deadZoomAmount = 0.0f;     // 0 .. 0.15, push-in amount (0 = off)
+        // v1.10.4: experiment -- after the swap the engine's picture sits at ~half brightness for
+        // ~800 ms and then steps to the real scene. The log rules out fPostLoadUpdateTimeMS (104 ms
+        // there) and rules out a fade ramp (the value is constant, not ramping), and we already stop
+        // FadeToBlack + FadeToBlackHold every step including at the cut. The one form we deliberately
+        // never touch is FadeToBlackBackImod -- cancelling it mid-transition restarts the engine's
+        // fade-in every 25 ms and strobes. After the cut that trade-off may flip. Off by default
+        // because it is still an experiment, not because it is dangerous.
+        // v1.12.0 COVER TEST -- the minimal experiment before any rewrite:
+        // Can the ENGINE's own fullscreen cover hold the screen during the dead window WITHOUT us
+        // touching Present? If yes (covers the whole screen, and the hand-back is clean), then the
+        // whole flicker problem is solved by never presenting our pixels again -- and the remaining
+        // work is only "show a texture instead of black".
+        //   0 = off (default)
+        //   1 = keep FadeToBlackImod at full strength through the dead window, stop it at the cut
+        //       (measured: this does NOTHING -- IMAD Trigger has no visible effect during a transition)
+        //   3 = UI-layer cover, drawn at RUNTIME into a menu movie the engine has already loaded
+        //       (v1.13.2). No SWF of our own is involved, so nothing can fail to load.
+        //   2 = UI-layer cover (v1.13.0): our own Scaleform menu showing a fullscreen quad, driven by
+        //       SetVariable("cover._alpha"). This never touches Present, so the upscaler's present
+        //       sequence stays intact -- the whole reason for this route.
+        int   coverTest = 0;
+        bool  cancelFadeBackAfterCut = false;
+        float deadBlurPx = 40.0f;        // 0 .. 120, frosted-glass radius at the end of the dead window
+        std::uint32_t deadZoomMs = 2000; // how long it takes to get there -- the user's 124-frame rule
+        std::uint32_t probeFrames = 90;  // how many Present calls the magenta probe lasts (1..600)
     };
     Config g_config;
 
@@ -309,7 +402,7 @@ namespace
         return n;
     }
 
-    void LoadLangFile(const char* a_path, bool a_override)
+    void LoadLangFile(const char* a_path, bool a_override, bool a_warnIfEmpty = true)
     {
         std::ifstream f(a_path);
         if (!f.is_open()) {
@@ -362,7 +455,9 @@ namespace
         }
         if (loaded) {
             logger::info("Language pack: {} -> {} menu strings", a_path, loaded);
-        } else {
+        } else if (a_warnIfEmpty) {
+            // Only the real language pack should warn. The main INI is probed first on purpose
+            // (it may carry a [Menu] override section) and normally yields nothing.
             logger::warn("Language pack: {} opened but yielded 0 strings", a_path);
         }
     }
@@ -371,7 +466,7 @@ namespace
     {
         const auto backup = g_lang;
         g_lang.clear();
-        LoadLangFile("Data/SKSE/Plugins/LoadingFlow.ini", false);
+        LoadLangFile("Data/SKSE/Plugins/LoadingFlow.ini", false, /*a_warnIfEmpty=*/false);
         LoadLangFile("Data/SKSE/Plugins/LoadingFlow_Lang.ini", true);
         if (g_lang.empty() && !backup.empty()) {
             g_lang = backup;
@@ -391,12 +486,35 @@ namespace
         return it->second.c_str();
     }
 
+    std::atomic<bool> g_shuttingDown{ false };
+
+    bool AtomicReplaceFile(const char* a_tmpPath, const char* a_dstPath)
+    {
+        std::error_code ec;
+        std::filesystem::rename(a_tmpPath, a_dstPath, ec);
+        if (!ec) {
+            return true;
+        }
+        ec.clear();
+        std::filesystem::copy_file(a_tmpPath, a_dstPath,
+            std::filesystem::copy_options::overwrite_existing, ec);
+        std::error_code rmEc;
+        std::filesystem::remove(a_tmpPath, rmEc);
+        if (ec) {
+            if (!g_shuttingDown.load(std::memory_order_acquire)) {
+                logger::error("Failed to replace {} from {}: {}", a_dstPath, a_tmpPath, ec.message());
+            }
+            return false;
+        }
+        return true;
+    }
+
     void SaveConfig()
     {
         static constexpr const char* kIniPath = "Data/SKSE/Plugins/LoadingFlow.ini";
         static constexpr const char* kTmpPath = "Data/SKSE/Plugins/LoadingFlow.ini.tmp";
         // P0-3: canonical must-write section list so new sections are never silently dropped
-        static constexpr const char* kMustWriteSections[] = { "General", "ExcludeCells", "Menu" };
+        static constexpr const char* kMustWriteSections[] = { "General", "ExcludeCells", "ForceRealTransition", "Menu" };
         (void)kMustWriteSections;
 
         {
@@ -421,7 +539,11 @@ namespace
             f << "bUsePocketCopies = " << (g_config.usePocketCopies ? 1 : 0) << "\r\n";
             f << "bSuppressLoadingMenu = " << (g_config.suppressLoadingMenu ? 1 : 0) << "\r\n";
             f << "uSuppressTimeoutMs = " << g_config.suppressTimeoutMs << "\r\n";
-            f << "uTransitionWindowMs = " << g_config.transitionWindowMs << "\r\n";
+            if (g_config.transitionWindowPinned) {
+                f << "uTransitionWindowMs = " << g_config.transitionWindowMs << "\r\n";
+            } else {
+                f << ";uTransitionWindowMs = 30000\r\n";
+            }
             f << "bPrewarmNearbyDoors = " << (g_config.prewarmNearbyDoors ? 1 : 0) << "\r\n";
             f << "uPrewarmModelCap = " << g_config.prewarmModelCap << "\r\n";
             f << std::format("fPrewarmRadius = {:.0f}\r\n", g_config.prewarmRadius);
@@ -441,6 +563,7 @@ namespace
             f << std::format("fFastTravelFadeSecs = {:.2f}\r\n", g_config.fastTravelFadeSecs);
             f << "iLoadingQueuedPriorityBudgetMs = " << g_config.loadingQueuedPriorityBudgetMs << "\r\n";
             f << "bNoBlackOnlyForManualDoors = " << (g_config.noBlackOnlyForManualDoors ? 1 : 0) << "\r\n";
+            f << "bNoBlackForWalkThrough = " << (g_config.noBlackForWalkThrough ? 1 : 0) << "\r\n";
             f << std::format("sCutMaskImod = 0x{:08X}\r\n", g_config.cutMaskImod);
             f << "uCutMaskMs = " << g_config.cutMaskMs << "\r\n";
             f << "bLogDoorActivations = " << (g_config.logDoorActivations ? 1 : 0) << "\r\n";
@@ -448,6 +571,7 @@ namespace
             f << "uFreezeMaxMs = " << g_config.freezeMaxMs << "\r\n";
             f << std::format("fCutMaskFadeOut = {:.2f}\r\n", g_config.cutMaskFadeOut);
             f << "uFreezeDelayMs = " << g_config.freezeDelayMs << "\r\n";
+            f << "uHoldAtCutMs = " << g_config.holdAtCutMs << "\r\n";
             f << "bProbeAssembly = " << (g_config.probeAssembly ? 1 : 0) << "\r\n";
             f << "uProbeAssemblyMs = " << g_config.probeAssemblyMs << "\r\n";
             f << "bProbeGfx = " << (g_config.probeGfx ? 1 : 0) << "\r\n";
@@ -475,23 +599,38 @@ namespace
             f << std::format("fOverlayMoteScale = {:.2f}\r\n", g_config.overlayMoteScale);
             f << "bCrossFade = " << (g_config.crossFade ? 1 : 0) << "\r\n";
             f << "uCrossFadeMs = " << g_config.crossFadeMs << "\r\n";
+            f << "uCrossFadeHoldMs = " << g_config.crossFadeHoldMs << "\r\n";
+            // ---- visual layer (v1.10.0) -------------------------------------------------------------
+            // These keys were read from the INI but never written back, so ANY menu edit rewrote the file
+            // without them and silently wiped the whole visual block -- exactly the failure this project
+            // already has a rule about: SaveConfig must write every key it reads.
+            f << "iVisualMode = " << g_config.visualMode << "\r\n";
+            f << "iSubmitRoute = " << g_config.submitRoute << "\r\n";
+            f << "bUsePresent1ForVisual = " << (g_config.usePresent1ForVisual ? 1 : 0) << "\r\n";
+            f << "bPresentAudit = " << (g_config.presentAudit ? 1 : 0) << "\r\n";
+            f << "iCoverTest = " << g_config.coverTest << "\r\n";
+            f << "bCancelFadeBackAfterCut = " << (g_config.cancelFadeBackAfterCut ? 1 : 0) << "\r\n";
+            f << std::format("fDeadZoomAmount = {:.3f}\r\n", g_config.deadZoomAmount);
+            f << "uDeadZoomMs = " << g_config.deadZoomMs << "\r\n";
+            f << std::format("fDeadBlurPx = {:.1f}\r\n", g_config.deadBlurPx);
+            f << "uProbeFrames = " << g_config.probeFrames << "\r\n";
             f << "bOverlayDebugFullscreen = " << (g_config.overlayDebugFullscreen ? 1 : 0) << "\r\n";
-            f << "bNoBlackForWalkThrough = " << (g_config.noBlackForWalkThrough ? 1 : 0) << "\r\n";
+            f << "iSuppressMode = " << g_config.suppressMode << "\r\n";
             f << "bGlobalMenuSuppression = " << (g_config.globalMenuSuppression ? 1 : 0) << "\r\n";
+            f << std::format("fBlinkStrength = {:.2f}\r\n", g_config.blinkStrength);
             f << std::format("fBaseAltitudeZ = {:.1f}\r\n", g_config.baseAltitudeZ);
             f << std::format("fSlotStepZ = {:.1f}\r\n", g_config.slotStepZ);
-            f << std::format("fBlinkStrength = {:.2f}\r\n", g_config.blinkStrength);
             f << "uDoorOpenDelayMs = " << g_config.doorOpenDelayMs << "\r\n";
             f << "uMaxRefsPerCell = " << g_config.maxRefsPerCell << "\r\n";
             f << "uMaxPocketSlots = " << g_config.maxPocketSlots << "\r\n";
             f << "\r\n[ExcludeCells]\r\n";
-            f << "; Add interior Cell FormIDs (0x...) or EditorIDs here to force vanilla loading screen\r\n";
+            f << "; Cells that skip the menu suppression entirely (real transition + normal menu).\r\n";
             for (const auto& s : g_excludeSpecs) {
                 f << s << " = 1\r\n";
             }
             f << "\r\n[ForceRealTransition]\r\n";
-            f << "; Cells that must use the engine's own (real) cell transition instead of a pocket\n";
-            f << "; copy: quest/location scripts inside them listen to cell events we cannot fake.\n";
+            f << "; Cells that must use the engine's own (real) cell transition instead of a pocket\r\n";
+            f << "; copy: quest/location scripts inside them listen to cell events we cannot fake.\r\n";
             for (const auto& s : g_forceRealSpecs) {
                 f << s << " = 1\r\n";
             }
@@ -508,13 +647,9 @@ namespace
             }
         }
 
-        std::error_code ec;
-        std::filesystem::rename(kTmpPath, kIniPath, ec);
-        if (ec) {
-            std::filesystem::copy_file(kTmpPath, kIniPath, std::filesystem::copy_options::overwrite_existing, ec);
-            std::filesystem::remove(kTmpPath, ec);
+        if (AtomicReplaceFile(kTmpPath, kIniPath)) {
+            logger::info("Config saved atomically to {}", kIniPath);
         }
-        logger::info("Config saved atomically to {}", kIniPath);
     }
 
     void LoadConfig()
@@ -625,9 +760,13 @@ namespace
                     } else if (key == "bSuppressLoadingMenu") {
                         g_config.suppressLoadingMenu = (std::stoi(val) != 0);
                     } else if (key == "uSuppressTimeoutMs") {
-                        g_config.suppressTimeoutMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 0, 5000));
+                        // v1.3.4e: was clamped to 5000, so an INI value of 6000 silently became 5000 while leaving
+                        // the key out gave 6000 -- the cap made the file lie. A heavily modded setup needs
+                        // fallbacks well past 5 s; the adaptive window is the real limit anyway.
+                        g_config.suppressTimeoutMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 0, 60000));
                     } else if (key == "uTransitionWindowMs") {
-                        g_config.transitionWindowMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 500, 30000));
+                        g_config.transitionWindowMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 500, 60000));
+                        g_config.transitionWindowPinned = true;
                     } else if (key == "bPrewarmNearbyDoors") {
                         g_config.prewarmNearbyDoors = (std::stoi(val) != 0);
                     } else if (key == "uPrewarmModelCap") {
@@ -653,7 +792,7 @@ namespace
                     } else if (key == "bLogDoorActivations") {
                         g_config.logDoorActivations = (std::stoi(val) != 0);
                     } else if (key == "uSuppressMaxMs") {
-                        g_config.suppressMaxMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 0, 30000));
+                        g_config.suppressMaxMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 0, 60000));
                     } else if (key == "uFreezeMaxMs") {
                         g_config.freezeMaxMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 0, 30000));
                     } else if (key == "bTweakEngineTimers") {
@@ -691,6 +830,8 @@ namespace
                         g_config.cutMaskFadeOut = std::clamp(std::stof(val), 0.0f, 2.0f);
                     } else if (key == "uFreezeDelayMs") {
                         g_config.freezeDelayMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 0, 600));
+                    } else if (key == "uHoldAtCutMs") {
+                        g_config.holdAtCutMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 0, 2000));
                     } else if (key == "bProbeAssembly") {
                         g_config.probeAssembly = (std::stoi(val) != 0);
                     } else if (key == "uProbeAssemblyMs") {
@@ -739,14 +880,38 @@ namespace
                         g_config.overlayPulseMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 50, 800));
                     } else if (key == "uOverlayMaxMs") {
                         g_config.overlayMaxMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 500, 15000));
+                    } else if (key == "iSuppressMode") {
+                        g_config.suppressMode = std::clamp(std::stoi(val), -1, 2);
                     } else if (key == "fOverlayMoteScale") {
                         g_config.overlayMoteScale = std::clamp(std::stof(val), 0.3f, 3.0f);
                     } else if (key == "bCrossFade") {
                         g_config.crossFade = (std::stoi(val) != 0);
                     } else if (key == "uCrossFadeMs") {
-                        g_config.crossFadeMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 60, 350));
+                        g_config.crossFadeMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 0, 800));
+                    } else if (key == "uCrossFadeHoldMs") {
+                        g_config.crossFadeHoldMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 0, 6000));
                     } else if (key == "bOverlayDebugFullscreen") {
                         g_config.overlayDebugFullscreen = (std::stoi(val) != 0);
+                    } else if (key == "iVisualMode") {
+                        g_config.visualMode = std::clamp(std::stoi(val), 0, 8);
+                    } else if (key == "bUsePresent1ForVisual") {
+                        g_config.usePresent1ForVisual = (std::stoi(val) != 0);
+                    } else if (key == "iSubmitRoute") {
+                        g_config.submitRoute = std::clamp(std::stoi(val), 0, 2);
+                    } else if (key == "bPresentAudit") {
+                        g_config.presentAudit = (std::stoi(val) != 0);
+                    } else if (key == "fDeadZoomAmount") {
+                        g_config.deadZoomAmount = std::clamp(std::stof(val), 0.0f, 0.15f);
+                    } else if (key == "uDeadZoomMs") {
+                        g_config.deadZoomMs = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 0, 4000));
+                    } else if (key == "iCoverTest") {
+                        g_config.coverTest = std::clamp(std::stoi(val), 0, 4);
+                    } else if (key == "bCancelFadeBackAfterCut") {
+                        g_config.cancelFadeBackAfterCut = (std::stoi(val) != 0);
+                    } else if (key == "fDeadBlurPx") {
+                        g_config.deadBlurPx = std::clamp(std::stof(val), 0.0f, 120.0f);
+                    } else if (key == "uProbeFrames") {
+                        g_config.probeFrames = static_cast<std::uint32_t>(std::clamp(std::stoi(val), 1, 600));
                     } else if (key == "bNoBlackForWalkThrough") {
                         g_config.noBlackForWalkThrough = (std::stoi(val) != 0);
                     } else if (key == "bGlobalMenuSuppression") {
@@ -929,6 +1094,23 @@ namespace
     RE::TESObjectSTAT*         g_blackPlaneStat = nullptr;
     RE::TESImageSpaceModifier* g_fadeImod = nullptr;
     RE::TESImageSpaceModifier* g_fadeBackImod = nullptr;
+
+    // v1.13.0 UI-layer cover (defined far below, used in the transition handlers above it)
+    void RegisterCoverMenu();
+    void SetCoverAlpha(float a_alpha01);
+    void SetRuntimeCoverAlpha(float a_alpha01);
+    // v1.14.0 iCoverTest=4: keep the Loading Menu alive and cover it with our own quad.
+    std::atomic<bool> g_coverUiWanted{ false };
+    // v1.15.0: cut 之后不再立刻撤覆盖,改为渐隐 —— 既不会露出引擎保留的旧帧,
+    // 也让引擎那 ~100 ms 的 fade-back(反向白闪的来源)藏在覆盖之下。
+    std::atomic<std::int64_t> g_coverFadeStart{ 0 };
+    std::atomic<int>          g_coverFadeMs{ 0 };
+    // v1.16.0: 磨玻璃纹理 —— 需要拿到"最后一帧"的像素。
+    std::atomic<void*>        g_lastSwapChain{ nullptr };
+    constexpr int             kCoverW = 40;    // 采样网格;放大后由双线性插值补成模糊
+    constexpr int             kCoverH = 22;
+    std::uint32_t             g_coverPx[kCoverW * kCoverH]{};
+    bool                      g_coverPxValid = false;
     // 0x000F756E = FadeToBlackHoldImod -- the engine's own "stay black" stage. Verified by dumping
     // all 263 IMAD records from Skyrim.esm + DLCs; using it is cleaner than re-triggering
     // FadeToBlackImod to fake a hold.
@@ -1921,6 +2103,147 @@ namespace
     // Last measured load time per destination cell. Written and read on the main thread only, so no
     // lock is needed. Drives the adaptive fallback (uSuppressMaxMs).
     std::unordered_map<RE::FormID, std::uint32_t> g_cellLoadMs;
+    // v1.3.4: persist the per-cell load history, otherwise the adaptive window forgets everything on
+    // restart and every heavy door pays the full "first time" penalty again in each session.
+    std::atomic<bool> g_cellTimesDirty{ false };
+    std::atomic<std::uint64_t> g_cellTimesSaveGen{ 0 };
+    std::mutex g_cellLoadMsMutex;    // protects g_cellLoadMs map
+    std::mutex g_cellTimesFileMutex; // serializes LoadingFlow_CellTimes.ini atomic writes
+    std::once_flag g_cellTimesLoadOnce;
+    constexpr const char* kCellTimesPath = "Data/SKSE/Plugins/LoadingFlow_CellTimes.ini";
+    constexpr const char* kCellTimesTmpPath = "Data/SKSE/Plugins/LoadingFlow_CellTimes.ini.tmp";
+
+    void LoadCellTimesOnce()
+    {
+        std::call_once(g_cellTimesLoadOnce, []() {
+            std::ifstream f(kCellTimesPath);
+            if (!f.is_open()) {
+                return;
+            }
+            auto trim = [](std::string_view sv) -> std::string_view {
+                const auto b = sv.find_first_not_of(" \t\r\n");
+                if (b == std::string_view::npos) {
+                    return {};
+                }
+                const auto e = sv.find_last_not_of(" \t\r\n");
+                return sv.substr(b, e - b + 1);
+            };
+            std::string line;
+            std::size_t n = 0;
+            std::unordered_map<RE::FormID, std::uint32_t> loaded;
+            bool firstLine = true;
+            while (std::getline(f, line) && n < 8192) {
+                if (firstLine) {
+                    firstLine = false;
+                    if (line.size() >= 3 &&
+                        static_cast<unsigned char>(line[0]) == 0xEF &&
+                        static_cast<unsigned char>(line[1]) == 0xBB &&
+                        static_cast<unsigned char>(line[2]) == 0xBF) {
+                        line.erase(0, 3);
+                    }
+                }
+                std::string_view sv(line);
+                if (const auto sc = sv.find(';'); sc != std::string_view::npos) {
+                    sv = sv.substr(0, sc);
+                }
+                sv = trim(sv);
+                if (sv.empty() || sv.front() == '#') {
+                    continue;
+                }
+                const auto eq = sv.find('=');
+                if (eq == std::string_view::npos) {
+                    continue;
+                }
+                const auto key = trim(sv.substr(0, eq));
+                const auto val = trim(sv.substr(eq + 1));
+                if (key.empty() || val.empty()) {
+                    continue;
+                }
+                std::string_view hexKey = key;
+                if (hexKey.starts_with("0x") || hexKey.starts_with("0X")) {
+                    hexKey.remove_prefix(2);
+                }
+                std::uint32_t id = 0;
+                std::uint32_t ms = 0;
+                const auto [pId, ecId] = std::from_chars(hexKey.data(), hexKey.data() + hexKey.size(), id, 16);
+                const auto [pMs, ecMs] = std::from_chars(val.data(), val.data() + val.size(), ms, 10);
+                if (ecId == std::errc{} && pId == hexKey.data() + hexKey.size() &&
+                    ecMs == std::errc{} && pMs == val.data() + val.size() &&
+                    id != 0 && ms > 0 && ms <= 600000u) {
+                    auto& slot = loaded[static_cast<RE::FormID>(id)];
+                    slot = (ms > slot) ? ms : slot;
+                    ++n;
+                }
+            }
+            if (!loaded.empty()) {
+                {
+                    std::lock_guard<std::mutex> lk(g_cellLoadMsMutex);
+                    for (const auto& [id, ms] : loaded) {
+                        auto& slot = g_cellLoadMs[id];
+                        slot = (ms > slot) ? ms : slot;
+                    }
+                }
+                logger::info("[Tier2] cell load history loaded: {} cell(s) from {}", loaded.size(), kCellTimesPath);
+            }
+        });
+    }
+
+    void SaveCellTimes()
+    {
+        if (g_shuttingDown.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::lock_guard<std::mutex> fileLk(g_cellTimesFileMutex);
+        if (g_shuttingDown.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (!g_cellTimesDirty.exchange(false, std::memory_order_acq_rel)) {
+            return;
+        }
+        std::unordered_map<RE::FormID, std::uint32_t> snap;
+        {
+            std::lock_guard<std::mutex> lk(g_cellLoadMsMutex);
+            snap = g_cellLoadMs;
+        }
+        {
+            std::ofstream f(kCellTimesTmpPath, std::ios::binary | std::ios::trunc);
+            if (!f.is_open()) {
+                g_cellTimesDirty.store(true, std::memory_order_release);
+                return;
+            }
+            f << "; LoadingFlow per-cell load times (written automatically, safe to delete)\r\n";
+            for (const auto& [id, ms] : snap) {
+                f << std::format("{:08X}={}\r\n", id, ms);
+            }
+            f.flush();
+            if (!f.good()) {
+                g_cellTimesDirty.store(true, std::memory_order_release);
+                return;
+            }
+        }
+        if (!AtomicReplaceFile(kCellTimesTmpPath, kCellTimesPath)) {
+            g_cellTimesDirty.store(true, std::memory_order_release);
+        }
+    }
+
+    void ScheduleCellTimesSave()
+    {
+        if (g_shuttingDown.load(std::memory_order_acquire)) {
+            return;
+        }
+        g_cellTimesDirty.store(true, std::memory_order_release);
+        const auto gen = g_cellTimesSaveGen.fetch_add(1, std::memory_order_acq_rel) + 1;
+        std::thread([gen]() {
+            for (int i = 0; i < 15; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (g_shuttingDown.load(std::memory_order_acquire) ||
+                    g_cellTimesSaveGen.load(std::memory_order_acquire) != gen) {
+                    return;
+                }
+            }
+            SaveCellTimes();
+        }).detach();
+    }
     // ---- Assembly probe state (READ-ONLY) ----------------------------------------------------
     // Armed right after a transition reports "finished"; the per-step main-thread task then samples
     // the player's transform and the camera FOV until they stop changing. Only the watchdog thread
@@ -1960,10 +2283,23 @@ namespace
     // up over a playable game, nothing ever hid it, and it ate all input (ESC and console included).
     // Reported by two users. Keep eating those requests for a grace window after the cut.
     std::atomic<std::int64_t> g_graceSuppressUntil{ 0 };
+    std::atomic<int>          g_graceEaten{ 0 };
     std::atomic<std::int64_t> g_suppressDeadline{ 0 };
     std::atomic<std::int64_t> g_fallbackAt{ 0 };   // set only AFTER we suppressed a menu
     std::atomic<std::int64_t> g_suppressStarted{ 0 };
+    // v1.3.0: the moment the loading menu was actually dropped, i.e. the first frame of the dead
+    // window. g_suppressStarted is the DOOR ACTIVATION, ~0.6 s earlier and still a live picture
+    // (the door swing) -- driving the push-in from that would freeze the door animation.
+    std::atomic<std::int64_t> g_deadWindowAt{ 0 };
     std::atomic<RE::FormID>   g_suppressFromCell{ 0 };
+    // v1.3.4: the destination we were told about -- a SECOND acceptance signal for "done".
+    // The from-cell inequality alone can silently never fire (measured on Understone Keep:
+    // the cell DID change in game, our check never matched, the overlay stayed in the dead
+    // window for 10 s and the frozen snapshot stayed on screen).
+    std::atomic<RE::FormID>   g_suppressDestCell{ 0 };
+    // v1.3.4: the window actually used for THIS transition (may be adapted from per-cell
+    // history). The re-post fallback is derived from it so it can never fire mid-load.
+    std::atomic<std::uint32_t> g_suppressWindowMs{ 0 };
 
     std::int64_t NowMs()
     {
@@ -2274,10 +2610,20 @@ namespace
     {
         void OnPresent(void* a_swapChain);
         void NotePresent();
+        bool NotePresentResult(long a_hr);   // v1.3.1: true the first time, so the caller logs it once
+        bool WantsPostPresentProbe();        // v1.3.1 mode 4
+        void PostPresentProbe(void* a_swapChain);
+        bool BypassToPresent1();             // v1.3.2 mode 6: submit through slot 22 instead of slot 8
         void Arm();
         void Cut();
         void Disarm(const char* a_reason);
         bool Active();
+        // v1.8.7: ask DXGI whether the Present we forwarded was counted at all.
+        bool AuditWanted();
+        void AuditPresent(void* a_swapChain, std::uint32_t a_presentsBefore, long a_hr, bool a_bypassed);
+        // v1.8.9 mode 8: after the frame has been handed down the chain, look at the buffers again.
+        bool WantsSurvivalCheck();
+        void SurvivalCheck(void* a_swapChain);
     }
 
     namespace presentfreeze
@@ -2290,8 +2636,18 @@ namespace
 
         PresentFn         g_origPresent = nullptr;
         Present1Fn        g_origPresent1 = nullptr;
+        // v1.3.3: Present1 (slot 22) is a flip-model API. On a bitblt chain it must not be used at all.
+        std::atomic<bool> g_flipModel{ true };
+        // v1.3.2: once we have decided this swap chain's vtable cannot be patched, stop retrying --
+        // InstallOn is called from several places and a repeated warn would flood the log.
+        // Per-swap-chain, not global: if the game recreates the swap chain we must be free to try
+        // again -- a fresh chain may well be hookable even when the previous one was not.
+        std::atomic<void*> g_gaveUpSwap{ nullptr };
         void*             g_hookedSwapChain = nullptr;
         std::atomic<bool> g_suppressPresent{ false };
+        // v1.3.2: when set, the overlay's pixels are submitted through slot 22 (Present1) instead of
+        // slot 8, which is where SPS sits and re-renders the frame.
+        std::atomic<bool> g_bypassToPresent1{ false };
         std::atomic<bool> g_installed{ false };
         std::atomic<bool> g_firstSkipLogged{ false };
         std::atomic<std::uint32_t> g_skippedFrames{ 0 };
@@ -2390,8 +2746,16 @@ namespace
                 logger::info("[Trace] stopped (6 s window)");
                 return;
             }
-            // Sample EVERY frame inside the watch window (a 1-frame black would slip through a 50 ms
-            // sampler); only write the trace line every 50 ms so the log stays readable.
+            // v1.10.2: this used to sample EVERY frame for the whole 6 s window. A luma sample is a
+            // CopySubresourceRegion plus Map(D3D11_MAP_READ) on a staging texture -- a full CPU/GPU
+            // sync. At ~130 fps that is roughly 780 blocking syncs per door, and the window runs on
+            // well past the cut into the live cell, so it cost real frame time exactly when the
+            // player wants control back. A 1-frame black is 7 ms and nobody has ever seen one; the
+            // only consumer that needs per-frame data is the auto gate, which is off by default.
+            const bool gateLive = g_autoGate.load(std::memory_order_relaxed);
+            if (!gateLive && NowMs() < g_traceNextAt.load()) {
+                return;   // nothing due this frame
+            }
             const float luma = SampleBackbufferLuma(a_swapChain);
             if (g_autoGate.load() && NowMs() < g_autoUntil.load() && !g_holdActive.load() &&
                 luma >= 0.0f && luma < 8.0f) {
@@ -2412,7 +2776,14 @@ namespace
         {
             // a_ms is now a SAFETY CAP; the gate opens by itself when the picture returns.
             g_heldFrames.store(0);
-            g_holdCapMs.store(a_ms == 0 ? 250u : a_ms);
+            // v1.3.2: 0 means OFF, not "250". Passing 0 used to still freeze for 250 ms, so there
+            // was no way at all to turn this off -- neither via the menu nor via the INI.
+            if (a_ms == 0) {
+                g_holdActive.store(false);
+                g_holdCapMs.store(0);
+                return;
+            }
+            g_holdCapMs.store(a_ms);
             g_holdStart.store(NowMs());
             g_holdActive.store(true);
             g_holdUntil.store(0);
@@ -2429,7 +2800,105 @@ namespace
         // the back buffer each frame while the gate is closed and open it as soon as the picture is
         // no longer black. uHoldAtCutMs becomes a SAFETY CAP, not a duration.
         // Average luma of a small centre patch, 0..255. Returns -1 when it cannot be read.
-        float SampleBackbufferLuma(void* a_swapChain)
+        // ---- v1.8.7: which back buffer is "the frame we are about to present"? ------------------
+        // This machine logs `2 buffer(s), effect FLIP_DISCARD`, and a flip-model chain rotates its
+        // back buffers on every Present: index 0 is the presented one only on every other frame.
+        // Every draw site in this file used to hard-code GetBuffer(0), so on half the frames we
+        // wrote into a buffer nobody would ever scan out. Worse, the `read-back after clear: luma
+        // 170.0` proof could never detect it -- it re-reads the very buffer we just wrote, so it is
+        // self-consistent by construction. That proof is therefore NOT evidence that the presented
+        // buffer contains our pixels, and it must stop being cited as one.
+        // DXGI only exposes the index on IDXGISwapChain3 (slot 36), which an older chain may not
+        // implement, so derive it from GetLastPresentCount() % BufferCount -- true for every
+        // flip-model effect. A bitblt chain has a single back buffer, so 0 is correct there.
+        std::uint32_t CurrentBackBufferIndex(IDXGISwapChain* a_sc)
+        {
+            if (!a_sc) {
+                return 0;
+            }
+            DXGI_SWAP_CHAIN_DESC desc{};
+            if (FAILED(a_sc->GetDesc(&desc)) || desc.BufferCount == 0) {
+                return 0;
+            }
+            const bool flipModel = (desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ||
+                                    desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
+            if (!flipModel || desc.BufferCount < 2) {
+                return 0;
+            }
+            UINT presented = 0;
+            const bool haveCount = SUCCEEDED(a_sc->GetLastPresentCount(&presented));
+            const std::uint32_t derived = haveCount ? static_cast<std::uint32_t>(presented % desc.BufferCount) : 0u;
+
+            // IDXGISwapChain3::GetCurrentBackBufferIndex (slot 36) is the authority, the modulo above
+            // is only a fallback for a chain that predates that interface. QueryInterface first:
+            // calling slot 36 on an older chain reads past the end of its vtable. If the two ever
+            // disagree, say so once -- a wrong index here would put us straight back into "the
+            // effect is invisible", and this time with no way to tell it from a broken chain.
+            std::uint32_t actual = derived;
+            bool fromChain3 = false;
+            // v1.8.9: the GUID used here in v1.8.7 was **IDXGISwapChain2's**, not 3's, so `authority n/a`
+            // in the shipped log did not mean "this chain lacks SwapChain3" -- it meant the probe asked
+            // the wrong question. Correct IIDs are spelled out so this cannot rot again:
+            //   1 = 790A45F7-0D42-4876-983A-0A55CFE6F4AA   2 = A8BE2AC4-1997-4948-B331-ABAC30C2320E
+            //   3 = 94D99BDB-F1F8-4AB0-B236-7DA0170EDAB1   4 = 3D585D5A-BD4A-489E-B1F4-3DBCB6452FFB
+            static const GUID kIID_SC1 = { 0x790a45f7u, 0x0d42u, 0x4876u, { 0x98, 0x3a, 0x0a, 0x55, 0xcf, 0xe6, 0xf4, 0xaa } };
+            static const GUID kIID_SC2 = { 0xa8be2ac4u, 0x1997u, 0x4948u, { 0xb3, 0x31, 0xab, 0xac, 0x30, 0xc2, 0x32, 0x0e } };
+            static const GUID kIID_SC3 = { 0x94d99bdbu, 0xf1f8u, 0x4ab0u, { 0xb2, 0x36, 0x7d, 0xa0, 0x17, 0x0e, 0xda, 0xb1 } };
+            static const GUID kIID_SC4 = { 0x3d585d5au, 0xbd4au, 0x489eu, { 0xb1, 0xf4, 0x3d, 0xbc, 0xb6, 0x45, 0x2f, 0xfb } };
+            auto supports = [a_sc](const GUID& a_iid) -> void* {
+                void* p = nullptr;
+                if (SUCCEEDED(a_sc->QueryInterface(a_iid, &p)) && p) {
+                    return p;   // caller releases
+                }
+                return nullptr;
+            };
+            if (void* sc3 = supports(kIID_SC3); sc3) {
+                if (auto** vt3 = *reinterpret_cast<void***>(sc3); vt3 && vt3[36]) {
+                    using GetCurrentBackBufferIndexFn = UINT(__stdcall*)(void*);
+                    // v1.3.2: never call a vtable slot we have not verified. Slot 36 is far past what a
+                    // wrapper normally implements; calling junk here is `call rdx` with a garbage target.
+                    if (IsExecutableAddress(vt3[36])) {
+                        actual = reinterpret_cast<GetCurrentBackBufferIndexFn>(vt3[36])(sc3);
+                    }
+                    fromChain3 = true;
+                }
+                reinterpret_cast<IUnknown*>(sc3)->Release();
+            }
+            static std::atomic<bool> s_bbIdxLogged{ false };
+            if (!s_bbIdxLogged.exchange(true)) {
+                // Identity of the object we are drawing on. A genuine DXGI swap chain answers all four
+                // interfaces and reports the game's own window; a proxy/composited wrapper created by a
+                // third-party module typically answers only some of them -- and if the window it reports
+                // is not the one we draw on, nothing we write here can ever be scanned out.
+                void* p1 = supports(kIID_SC1);
+                void* p2 = supports(kIID_SC2);
+                void* p4 = supports(kIID_SC4);
+                HWND hwndFromChain = nullptr;
+                if (p1) {
+                    reinterpret_cast<IDXGISwapChain1*>(p1)->GetHwnd(&hwndFromChain);
+                }
+                logger::info("[Chain] object: SwapChain1={} 2={} 3={} 4={} ({}) hwndFromChain=0x{:X} descOutputWindow=0x{:X}{}",
+                    p1 ? "yes" : "NO", p2 ? "yes" : "NO", fromChain3 ? "yes" : "NO", p4 ? "yes" : "NO",
+                    (p1 && p4) ? "looks like a genuine DXGI chain" : "*** partial QI surface -- possible wrapper ***",
+                    reinterpret_cast<std::uintptr_t>(hwndFromChain),
+                    reinterpret_cast<std::uintptr_t>(desc.OutputWindow),
+                    (hwndFromChain && desc.OutputWindow && hwndFromChain != desc.OutputWindow)
+                        ? "  *** THE CHAIN PRESENTS TO A DIFFERENT WINDOW THAN THE ONE WE DRAW ON ***" : "");
+                if (p1) { reinterpret_cast<IUnknown*>(p1)->Release(); }
+                if (p2) { reinterpret_cast<IUnknown*>(p2)->Release(); }
+                if (p4) { reinterpret_cast<IUnknown*>(p4)->Release(); }
+                logger::info("[Chain] back-buffer index: authority {} / modulo-derived {} / {} buffers / lastPresent {}{}",
+                    fromChain3 ? std::to_string(actual) : std::string("n/a"), derived, desc.BufferCount,
+                    haveCount ? std::to_string(presented) : std::string("n/a"),
+                    (fromChain3 && actual != derived) ? "  <== DISAGREE, using slot 36" : "");
+            }
+            return fromChain3 ? actual : derived;
+        }
+
+        // v1.8.9: sample ONE named back buffer. a_index == 0xFFFFFFFF means "whatever the chain says is
+        // current". Mode 8 needs to look at every buffer separately, after the present, to find out
+        // whether our pixels survived the rest of the chain or were overwritten there.
+        float SampleBufferLumaAt(void* a_swapChain, std::uint32_t a_index)
         {
             using namespace RE::BSGraphics;
             auto* rd = Renderer::GetRendererData();
@@ -2439,8 +2908,9 @@ namespace
                 return -1.0f;
             }
             auto* sc = static_cast<IDXGISwapChain*>(a_swapChain);
+            const std::uint32_t idx = (a_index == 0xFFFFFFFFu) ? CurrentBackBufferIndex(sc) : a_index;
             ID3D11Texture2D* back = nullptr;
-            if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back))) || !back) {
+            if (FAILED(sc->GetBuffer(idx, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back))) || !back) {
                 return -1.0f;
             }
             D3D11_TEXTURE2D_DESC desc{};
@@ -2487,6 +2957,11 @@ namespace
             return luma;
         }
 
+        float SampleBackbufferLuma(void* a_swapChain)
+        {
+            return SampleBufferLumaAt(a_swapChain, 0xFFFFFFFFu);
+        }
+
         // true => withhold this frame. Opens the gate by itself as soon as the picture is back.
         bool ShouldWithhold(void* a_swapChain)
         {
@@ -2495,6 +2970,23 @@ namespace
             }
             if (!g_holdActive.load()) {
                 return false;
+            }
+            // v1.3.0 safety guard: never hold the screen past the transition window.
+            // This runs on the RENDER thread (the Present hook), which keeps running even while the
+            // main thread is blocked inside a cell load. Measured on a stuck transition: our luma
+            // trace kept running for the whole 6 s window while the main-thread fallback only landed
+            // 31 s late. Without this guard a stalled load leaves the player looking at a frozen
+            // frame with the HUD gone -- exactly what two users reported on 1.2.1.
+            {
+                const auto deadline = g_suppressDeadline.load();
+                // Only meaningful while a transition is armed. g_suppressDeadline is never cleared,
+                // so without this check a freeze armed outside a transition (the black-frame auto
+                // gate) would be released instantly by a stale deadline from a previous door.
+                if (g_suppressArmed.load() && deadline != 0 && NowMs() > deadline) {
+                    g_holdActive.store(false);
+                    logger::warn("[Hold] released by safety guard (past the transition window)");
+                    return false;
+                }
             }
             const auto elapsed = NowMs() - g_holdStart.load();
             const auto cap = static_cast<std::int64_t>(g_holdCapMs.load());
@@ -2508,9 +3000,10 @@ namespace
             return true;
         }
 
-        long HookedPresent(void* a_swapChain, unsigned int a_sync, unsigned int a_flags)
+        long HookedPresentBody(void* a_swapChain, unsigned int a_sync, unsigned int a_flags)
         {
             g_frameCount.fetch_add(1, std::memory_order_relaxed);
+            g_lastSwapChain.store(a_swapChain);   // v1.16.0: UI 覆盖要用它取最后一帧的像素
             if (ShouldWithhold(a_swapChain)) {
                 if (g_heldFrames.fetch_add(1) == 0) {
                     logger::info("[Hold] cut: withholding Present until the picture is back");
@@ -2531,12 +3024,60 @@ namespace
                 }
                 return 0;   // S_OK: keep the currently displayed image on screen
             }
-            return g_origPresent ? g_origPresent(a_swapChain, a_sync, a_flags) : 0;
+            long hr;
+            const bool bypass = voidoverlay::BypassToPresent1() && g_origPresent1 != nullptr &&
+                                g_flipModel.load();   // v1.3.3: Present1 is flip-model only
+            // v1.8.7: read the counter BEFORE we hand the frame down, so the delta belongs to exactly
+            // this one Present and to nobody else's.
+            UINT presentsBefore = 0;
+            const bool audit = voidoverlay::AuditWanted() && a_swapChain && voidoverlay::Active() &&
+                               SUCCEEDED(static_cast<IDXGISwapChain*>(a_swapChain)->GetLastPresentCount(&presentsBefore));
+            if (bypass) {
+                // mode 6 / iSubmitRoute: go around slot 8 (SPS) and submit through slot 22 directly.
+                // v1.10.7 route 3: feed the normal chain FIRST so the upscaler sees its usual present,
+                // then present again through slot 22 so the frame that lands is ours.
+                // v1.3.3 CRASH FIX: pPresentParameters is NOT optional. Passing nullptr makes the
+                // call fault inside dxgi.dll (measured: ACCESS_VIOLATION_NULL at dxgi.dll+0x6aab6).
+                DXGI_PRESENT_PARAMETERS presentParams{};
+                hr = g_origPresent1(a_swapChain, a_sync, a_flags, &presentParams);
+            } else {
+                hr = g_origPresent ? g_origPresent(a_swapChain, a_sync, a_flags) : 0;
+            }
+            if (voidoverlay::WantsSurvivalCheck()) {
+                voidoverlay::SurvivalCheck(a_swapChain);
+            }
+            if (audit) {
+                static std::atomic<std::uint32_t> s_auditTick{ 0 };
+                if ((s_auditTick.fetch_add(1, std::memory_order_relaxed) % 15u) == 0 ||
+                    presentsBefore == 0) {
+                    voidoverlay::AuditPresent(a_swapChain, static_cast<std::uint32_t>(presentsBefore), hr, bypass);
+                }
+            }
+            // v1.3.1: the return value of the REAL Present is the one fact we never recorded. If it
+            // is DXGI_STATUS_OCCLUDED (0x087A0001) the driver is telling us the window is covered,
+            // and nothing we draw can ever become visible -- which would look exactly like "the
+            // overlay is never presented".
+            if (voidoverlay::NotePresentResult(hr)) {
+                const auto u = static_cast<unsigned long>(hr);
+                const char* note = (u == 0x087A0001ul) ? "  <== DXGI_STATUS_OCCLUDED: the window is occluded"
+                                  : (u == 0x087A0002ul) ? "  <== DXGI_STATUS_MODE_CHANGED"
+                                  : (u == 0x087A0007ul) ? "  <== DXGI_STATUS_CLIPPED"
+                                                        : "";
+                logger::info("[Present] the real Present returned 0x{:08X}{}", static_cast<unsigned>(hr), note);
+            }
+            // v1.3.1 mode 4: flood AFTER the real Present, then present once more. Diagnostic only.
+            if (voidoverlay::WantsPostPresentProbe()) {
+                voidoverlay::PostPresentProbe(a_swapChain);
+                if (g_origPresent) {
+                    g_origPresent(a_swapChain, a_sync, a_flags);
+                }
+            }
+            return hr;
         }
 
         // Same body for IDXGISwapChain1::Present1 (slot 22). A flip-model chain can present through
         // Present1 only, in which case the slot-8 hook would never run -- and the overlay with it.
-        long HookedPresent1(void* a_swapChain, unsigned int a_sync, unsigned int a_flags, const void* a_params)
+        long HookedPresent1Body(void* a_swapChain, unsigned int a_sync, unsigned int a_flags, const void* a_params)
         {
             g_frameCount.fetch_add(1, std::memory_order_relaxed);
             if (ShouldWithhold(a_swapChain)) {
@@ -2553,7 +3094,43 @@ namespace
                 }
                 return 0;
             }
-            return g_origPresent1 ? g_origPresent1(a_swapChain, a_sync, a_flags, a_params) : 0;
+            // v1.3.2: pPresentParameters may not be NULL. If a forwarder hands us one, substitute a
+            // cleared block instead of passing the NULL through and faulting inside dxgi.dll.
+            static thread_local DXGI_PRESENT_PARAMETERS safeParams{};
+            return g_origPresent1 ? g_origPresent1(a_swapChain, a_sync, a_flags,
+                a_params ? a_params : &safeParams) : 0;
+        }
+
+        // v1.10.2: an exception escaping a Present hook lands on the engine's render thread and takes
+        // the process with it. Nothing in this file is worth a CTD, so both bodies are wrapped: if
+        // anything throws, drop the overlay for the rest of the session and present as if we had
+        // never been here.
+        long HookedPresent(void* a_swapChain, unsigned int a_sync, unsigned int a_flags)
+        {
+            try {
+                return HookedPresentBody(a_swapChain, a_sync, a_flags);
+            } catch (...) {
+                logger::error("[Overlay] exception inside the Present hook -- overlay disabled, game kept alive");
+                g_bypassToPresent1.store(false);
+                voidoverlay::Disarm("exception inside the Present hook");
+                return g_origPresent ? g_origPresent(a_swapChain, a_sync, a_flags) : 0;
+            }
+        }
+
+        long HookedPresent1(void* a_swapChain, unsigned int a_sync, unsigned int a_flags, const void* a_params)
+        {
+            try {
+                return HookedPresent1Body(a_swapChain, a_sync, a_flags, a_params);
+            } catch (...) {
+                logger::error("[Overlay] exception inside the Present1 hook -- overlay disabled, game kept alive");
+                g_bypassToPresent1.store(false);
+                voidoverlay::Disarm("exception inside the Present1 hook");
+                // v1.3.2: pPresentParameters may not be NULL. If a forwarder hands us one, substitute a
+            // cleared block instead of passing the NULL through and faulting inside dxgi.dll.
+            static thread_local DXGI_PRESENT_PARAMETERS safeParams{};
+            return g_origPresent1 ? g_origPresent1(a_swapChain, a_sync, a_flags,
+                a_params ? a_params : &safeParams) : 0;
+            }
         }
 
         bool InstallOn(void* a_swapChain)
@@ -2564,14 +3141,55 @@ namespace
             if (a_swapChain == g_hookedSwapChain) {
                 return true;
             }
+            if (g_gaveUpSwap.load(std::memory_order_relaxed) == a_swapChain) {
+                return false;   // already decided this particular chain is not patchable
+            }
             auto** vtbl = *reinterpret_cast<void***>(a_swapChain);
             if (!vtbl) {
                 return false;
             }
             constexpr std::size_t kPresentIdx = 8;   // IDXGISwapChain::Present
+
+            // v1.3.2 CRASH FIX #2 (measured on a Community Shaders DXGISwapChainProxy):
+            // skipping slot 22 was NOT enough. That object answers QI for the newer interfaces but its
+            // vtable does not actually carry them, so *any* call through the slots past IDXGISwapChain
+            // lands on junk. The second crash kept the same signature (`call rdx`, junk pointer, our
+            // Present hook on the stack) even with slot 22 untouched.
+            // So: probe the object first. If slot 22 is not real code, treat the WHOLE vtable as
+            // untrustworthy and hook nothing at all -- the loading-screen removal and the timer
+            // trimming do not need this hook, and the visual layer is off by default anyway.
+            {
+                IDXGISwapChain1* probe = nullptr;
+                if (SUCCEEDED((reinterpret_cast<IUnknown*>(a_swapChain))->QueryInterface(
+                        __uuidof(IDXGISwapChain1), reinterpret_cast<void**>(&probe))) && probe) {
+                    auto** pvt = *reinterpret_cast<void***>(probe);
+                    const bool slot22ok = pvt && IsExecutableAddress(pvt[22]);
+                    probe->Release();
+                    if (!slot22ok) {
+                        logger::warn("[B] this swap chain is a wrapper whose vtable does not actually implement"
+                                     " IDXGISwapChain1 (slot 22 is not code) -- hooking NOTHING on it. The visual"
+                                     " layer stays off for this session; the loading-screen removal and the timer"
+                                     " trimming are unaffected.");
+                        g_gaveUpSwap.store(a_swapChain, std::memory_order_relaxed);
+                        return false;
+                    }
+                }
+            }
+
+            // v1.3.2 CRASH FIX: validate BEFORE adopting the pointer and BEFORE unprotecting the
+            // page. If we adopted first, a proxy that hands back a vtable whose Present entry is
+            // not real code would poison g_origPresent forever, and HookedPresent1 forwards into
+            // g_origPresent -- so the crash would simply move to the other entry point.
+            if (!IsExecutableAddress(vtbl[kPresentIdx])) {
+                logger::warn("[B] slot 8 (Present) does not hold a valid code pointer ({}) -- refusing to hook"
+                             " this swap chain at all", reinterpret_cast<const void*>(vtbl[kPresentIdx]));
+                g_gaveUpSwap.store(a_swapChain, std::memory_order_relaxed);
+                return false;
+            }
             DWORD oldProtect = 0;
             if (!VirtualProtect(&vtbl[kPresentIdx], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
                 logger::warn("[B] VirtualProtect failed on the swap chain vtable; freeze-frame disabled");
+                g_gaveUpSwap.store(a_swapChain, std::memory_order_relaxed);
                 return false;
             }
             if (!g_origPresent) {
@@ -2581,16 +3199,46 @@ namespace
             DWORD ignored = 0;
             VirtualProtect(&vtbl[kPresentIdx], sizeof(void*), oldProtect, &ignored);
 
+            // v1.3.3: Present1 is a flip-model API. On a bitblt chain (DXGI_SWAP_EFFECT_DISCARD /
+            // SEQUENTIAL -- the classic 2-buffer path) it is not a supported call, and forwarding
+            // into it faults downstream (measured: dxgi.dll+0x6aab6, ACCESS_VIOLATION_NULL).
+            // So read the swap effect first and refuse to touch slot 22 unless this really is flip.
+            {
+                DXGI_SWAP_CHAIN_DESC scd{};
+                const bool haveDesc = SUCCEEDED(reinterpret_cast<IDXGISwapChain*>(a_swapChain)->GetDesc(&scd));
+                const bool flip = haveDesc && (scd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ||
+                                               scd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
+                presentfreeze::g_flipModel.store(flip);
+                if (haveDesc && !flip) {
+                    logger::warn("[B] swap chain is bitblt (SwapEffect={}, {} buffer(s)) -- Present1 is a"
+                                 " flip-model API, so slot 22 is neither hooked nor used on this chain;"
+                                 " submissions stay on slot 8",
+                        static_cast<int>(scd.SwapEffect), scd.BufferCount);
+                }
+            }
             // Slot 22 (IDXGISwapChain1::Present1) only exists on a 1+ chain. Writing past the end
             // of a shorter vtable would corrupt the neighbouring .rdata, so ask first.
             IDXGISwapChain1* sc1 = nullptr;
-            if (SUCCEEDED((reinterpret_cast<IUnknown*>(a_swapChain))->QueryInterface(
+            if (presentfreeze::g_flipModel.load() &&
+                SUCCEEDED((reinterpret_cast<IUnknown*>(a_swapChain))->QueryInterface(
                     __uuidof(IDXGISwapChain1), reinterpret_cast<void**>(&sc1))) &&
                 sc1) {
                 auto** vtbl1 = *reinterpret_cast<void***>(sc1);
                 constexpr std::size_t kPresent1Idx = 22;   // IDXGISwapChain1::Present1
                 DWORD prot1 = 0;
-                if (vtbl1 && VirtualProtect(&vtbl1[kPresent1Idx], sizeof(void*), PAGE_EXECUTE_READWRITE, &prot1)) {
+                // v1.3.2 CRASH FIX: QueryInterface succeeding does NOT prove the vtable actually
+                // extends to slot 22. Community Shaders' DXGISwapChainProxy answers the QI but its
+                // slot 22 holds junk (measured: 0x43d608efa04bfb29), so adopting it as "original
+                // Present1" and calling it later faults at `call rdx` on the first presented frame.
+                // Same guard the ProcessMessage / Activate hooks already use.
+                const bool slot22IsCode = vtbl1 && IsExecutableAddress(vtbl1[kPresent1Idx]);
+                if (vtbl1 && !slot22IsCode) {
+                    logger::warn("[B] slot 22 (Present1) does not hold a valid code pointer ({}) -- leaving it alone;"
+                                 " this chain is a proxy that does not implement IDXGISwapChain1 properly."
+                                 " Overlay submission falls back to slot 8.",
+                        reinterpret_cast<const void*>(vtbl1[kPresent1Idx]));
+                }
+                if (slot22IsCode && VirtualProtect(&vtbl1[kPresent1Idx], sizeof(void*), PAGE_EXECUTE_READWRITE, &prot1)) {
                     if (!g_origPresent1) {
                         g_origPresent1 = reinterpret_cast<Present1Fn>(vtbl1[kPresent1Idx]);
                     }
@@ -3080,15 +3728,28 @@ namespace
             float motes;
             float pulseMs;
             float moteScale;
-            float blitAlpha;   // 1 = fully the old frame, 0 = fully the new one (cross-fade)
+            float blitAlpha;   // 1 = fully the old frame, 0 = fully the new one
+            float zoom;        // v1.3.0: 1.0 = pixel exact, >1 = pushed in (see PSBlit)
+            float blurPx;      // v1.10.0: frosted-glass radius in pixels (0 = sharp)
+            float pad[2];      // keeps the struct at 64 B, matching the HLSL cbuffer
         };
-        static_assert(sizeof(Params) == 48, "Params must match the HLSL cbuffer layout exactly");
+        static_assert(sizeof(Params) == 64, "Params must match the HLSL cbuffer layout exactly");
 
         std::atomic<bool>          g_armed{ false };
         std::atomic<bool>          g_cut{ false };
         std::atomic<bool>          g_failed{ false };
         std::atomic<std::int64_t>  g_armAt{ 0 };
         std::atomic<std::int64_t>  g_cutAt{ 0 };
+        // v1.10.3 unveil detection: the engine does not reveal the finished cell at the swap. Measured
+        // on this setup it sits on a dark frame (luma ~35) for ~800 ms -- exactly fPostLoadUpdateTimeMS
+        // -- and then jumps straight to the real scene (luma ~110). A fixed-length dissolve can never
+        // hide that: it ends before the jump, so the jump lands with nothing covering it. That step IS
+        // the "violent flash". So hold the old picture and start the dissolve when the picture changes.
+        std::atomic<float>         g_cutBaseLuma{ -1.0f };   // engine luma right after the swap
+        std::atomic<std::int64_t>  g_dissolveAt{ 0 };        // when the alpha ramp starts (0 = not yet)
+        std::atomic<std::int64_t>  g_lastCutSample{ 0 };
+        std::atomic<float>         g_prevCutLuma{ -1.0f };
+        std::atomic<bool>          g_waitCapLogged{ false };
         std::atomic<std::int64_t>  g_lastDrawAt{ 0 };
         std::atomic<std::uint32_t> g_draws{ 0 };
         // Diagnostic: how many Present/Present1 calls actually reached us while a transition was
@@ -3103,8 +3764,117 @@ namespace
         std::atomic<float>         g_cfgMoteScale{ 1.0f };
         std::atomic<std::uint32_t> g_cfgMotes{ 18 };
         std::atomic<std::uint32_t> g_cfgPulseMs{ 300 };
-        std::atomic<std::uint32_t> g_cfgCrossFadeMs{ 350 };
+        std::atomic<float>         g_cfgCrossFadeMs{ 350 };
+        std::atomic<std::uint32_t> g_cfgCrossFadeHoldMs{ 200 };
         std::atomic<bool>          g_cfgCrossFade{ true };
+        // v1.3.0 frozen-frame pass + probe
+        std::atomic<int>           g_cfgVisualMode{ 1 };
+        std::atomic<float>         g_cfgDeadZoomAmount{ 0.0f };
+        std::atomic<float>         g_cfgDeadBlurPx{ 40.0f };
+        std::atomic<std::uint32_t> g_cfgDeadZoomMs{ 2000 };
+        std::atomic<std::uint32_t> g_cfgProbeFrames{ 90 };
+        std::atomic<int>           g_probeLeft{ 0 };
+        std::atomic<long>          g_lastPresentHr{ 0 };
+        std::atomic<bool>          g_probeReadbackDone{ false };
+        std::atomic<bool>          g_probeAllBuffersLogged{ false };
+        std::atomic<std::uint32_t> g_transientFailures{ 0 };
+        std::atomic<bool>          g_presentHrLogged{ false };
+        std::atomic<int>           g_postProbeLeft{ 0 };   // v1.3.1 mode 4
+        std::atomic<bool>          g_cfgUsePresent1{ false };   // v1.3.4 blit frames may bypass slot 8
+        std::atomic<int>           g_cfgSubmitRoute{ 0 };       // v1.8.7 phase-scoped submit routing
+        std::atomic<bool>          g_cfgPresentAudit{ false };  // v1.8.7 ask DXGI whether it counted
+        std::atomic<bool>          g_bypassBlockedBySuppress{ false };
+        std::atomic<std::uint32_t> g_survivalLeft{ 0 };   // v1.8.9 mode 8 frames still to inspect
+        std::atomic<std::uint32_t> g_survivalTick{ 0 };
+
+        // ---- v1.8.9 mode 8: did our pixels survive the rest of the chain? ------------------------
+        // Mode 7 proved the buffer choice is not the problem: both back buffers were flooded and the
+        // screen stayed clean. That leaves exactly two possibilities, and this separates them:
+        //   * the buffers still hold magenta after we hand the frame down  -> nothing rewrote them, so
+        //     the buffer we filled is not the one that gets scanned out (the object we hold is not the
+        //     chain that reaches the display);
+        //   * the buffers no longer hold magenta                          -> something below us redraws
+        //     the frame between our clear and the flip.
+        bool WantsSurvivalCheck()
+        {
+            return g_survivalLeft.load(std::memory_order_relaxed) > 0;
+        }
+
+        void SurvivalCheck(void* a_swapChain)
+        {
+            if (!a_swapChain) {
+                return;
+            }
+            const std::uint32_t left = g_survivalLeft.load(std::memory_order_relaxed);
+            if (left == 0) {
+                return;
+            }
+            const std::uint32_t tick = g_survivalTick.fetch_add(1, std::memory_order_relaxed);
+            if ((tick % 30u) != 0) {
+                g_survivalLeft.fetch_sub(1, std::memory_order_relaxed);
+                return;
+            }
+            auto* sc = static_cast<IDXGISwapChain*>(a_swapChain);
+            DXGI_SWAP_CHAIN_DESC d{};
+            if (FAILED(sc->GetDesc(&d))) {
+                g_survivalLeft.fetch_sub(1, std::memory_order_relaxed);
+                return;
+            }
+            for (UINT i = 0; i < d.BufferCount && i < 4; ++i) {
+                const float l = presentfreeze::SampleBufferLumaAt(a_swapChain, i);
+                const bool magenta = (l > 150.0f && l < 190.0f);
+                logger::info("[Probe] after present: buffer {}/{} luma {:.1f} -> {}", i, d.BufferCount, l,
+                    magenta ? "STILL OUR MAGENTA -- nothing rewrote it, so this buffer is never scanned out"
+                            : "content was replaced after our clear -- something below us redraws the frame");
+            }
+            g_survivalLeft.fetch_sub(1, std::memory_order_relaxed);
+        }
+
+        // ---- v1.8.7: did the frame we forwarded actually get presented? -------------------------
+        // Every earlier verdict of "the pixels are discarded somewhere below us" rested on
+        // `[Present] the real Present returned 0x00000000`, and S_OK proves only that the function
+        // we called did not report an error. It does not prove the frame reached the display, and
+        // this file has three paths that return 0 without presenting anything at all.
+        // GetLastPresentCount is the one counter in this process that answers the real question, so
+        // read it before and after we hand the frame down. delta 0 = the chain never presented our
+        // frame (our fault, not the compositor's); delta >= 1 = DXGI accepted it and whatever goes
+        // wrong afterwards is downstream of DXGI.
+        // GetFrameStatistics is deliberately not used: it is unsupported on a flip-model chain
+        // (DXGI_ERROR_UNSUPPORTED), and this chain is FLIP_DISCARD.
+        bool AuditWanted()
+        {
+            return g_cfgPresentAudit.load(std::memory_order_relaxed);
+        }
+
+        void AuditPresent(void* a_swapChain, std::uint32_t a_presentsBefore, long a_hr, bool a_bypassed)
+        {
+            if (!a_swapChain) {
+                return;
+            }
+            auto* sc = static_cast<IDXGISwapChain*>(a_swapChain);
+            UINT after = 0;
+            if (FAILED(sc->GetLastPresentCount(&after))) {
+                logger::info("[PA] GetLastPresentCount failed -- cannot tell whether the frame was counted");
+                return;
+            }
+            const long delta = static_cast<long>(after) - static_cast<long>(a_presentsBefore);
+            DXGI_SWAP_CHAIN_DESC desc{};
+            const bool haveDesc = SUCCEEDED(sc->GetDesc(&desc));
+            // v1.8.8: `delta 0` is NOT proof that the frame was dropped. The shipped v1.8.7 log showed
+            // the counter advancing by ~30 between two samples while reading 0 across our own call,
+            // i.e. GetLastPresentCount is incremented asynchronously, not inside the call we make.
+            // So this line now reports both numbers and never cries wolf: `sincePrev` is the real
+            // "is the chain still presenting at all" signal.
+            static std::atomic<std::uint32_t> s_lastSeen{ 0 };
+            const std::uint32_t prevSeen = s_lastSeen.exchange(after, std::memory_order_relaxed);
+            const long sincePrev = static_cast<long>(after) - static_cast<long>(prevSeen);
+            logger::info("[PA] present {} -> {} (delta {}, sincePrev {}) hr=0x{:08X}{} route={} bypass={} cut={} bbidx={} of {}",
+                a_presentsBefore, after, delta, sincePrev, static_cast<unsigned>(a_hr),
+                sincePrev > 0 && delta == 0 ? "  (counter is asynchronous -- delta 0 here is normal)" : "",
+                g_cfgSubmitRoute.load(std::memory_order_relaxed), a_bypassed ? 1 : 0,
+                g_cut.load(std::memory_order_relaxed) ? 1 : 0,
+                presentfreeze::CurrentBackBufferIndex(sc), haveDesc ? desc.BufferCount : 0u);
+        }
         std::atomic<bool>          g_fadeLogged{ false };
         std::atomic<bool>          g_fadeResWarned{ false };
         std::atomic<bool>          g_cfgDebugFull{ false };
@@ -3127,6 +3897,10 @@ namespace
         UINT                          g_snapH = 0;
         DXGI_FORMAT                   g_snapFmt = DXGI_FORMAT_UNKNOWN;
         std::int64_t                  g_snapAt = 0;
+        bool                          g_snapValid = false;      // g_snapTex holds a real picture
+        float                         g_snapLuma = -1.0f;       // luma of the frame we copied
+        float                         g_snapMaxLuma = -1.0f;    // brightest frame seen this transition
+        std::int64_t                  g_snapSampleAt = 0;       // last luma sample (10 Hz throttle)
 
         template <class T>
         void SafeRelease(T*& a_ptr)
@@ -3137,13 +3911,144 @@ namespace
             }
         }
 
+        // ---- v1.3.0 presentation-chain forensics (one line each, first draw only) --------------
+        // Every "we drew it but it is not on screen" mystery so far was argued from proxies. This
+        // prints the chain itself, once per session: which texture we draw on, which swap chain it
+        // came from, what that chain's effect mode is, and whether its device is the one
+        // RendererData advertises. If those two disagree, that is the whole answer.
+        std::atomic<bool> g_chainLogged{ false };
+
+        const char* FormatName(DXGI_FORMAT a_fmt)
+        {
+            switch (a_fmt) {
+            case DXGI_FORMAT_R8G8B8A8_UNORM:        return "R8G8B8A8_UNORM";
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:   return "R8G8B8A8_UNORM_SRGB";
+            case DXGI_FORMAT_B8G8R8A8_UNORM:        return "B8G8R8A8_UNORM";
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:   return "B8G8R8A8_UNORM_SRGB";
+            case DXGI_FORMAT_R10G10B10A2_UNORM:     return "R10G10B10A2_UNORM (10-bit)";
+            case DXGI_FORMAT_R16G16B16A16_FLOAT:    return "R16G16B16A16_FLOAT";
+            default:                                return "other";
+            }
+        }
+
+        const char* EffectName(DXGI_SWAP_EFFECT a_effect)
+        {
+            switch (a_effect) {
+            case DXGI_SWAP_EFFECT_DISCARD:            return "DISCARD (bitblt)";
+            case DXGI_SWAP_EFFECT_SEQUENTIAL:         return "SEQUENTIAL (bitblt)";
+            case DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL:    return "FLIP_SEQUENTIAL";
+            case DXGI_SWAP_EFFECT_FLIP_DISCARD:       return "FLIP_DISCARD";
+            default:                                  return "unknown";
+            }
+        }
+
+        void LogChain(IDXGISwapChain* a_sc, ID3D11Texture2D* a_back, ID3D11Device* a_device, ID3D11DeviceContext* a_ctx)
+        {
+            using namespace RE::BSGraphics;
+            D3D11_TEXTURE2D_DESC td{};
+            a_back->GetDesc(&td);
+            DXGI_SWAP_CHAIN_DESC sd{};
+            const bool haveDesc = SUCCEEDED(a_sc->GetDesc(&sd));
+
+            auto*             rd = Renderer::GetRendererData();
+            auto*             gameDev = rd ? reinterpret_cast<ID3D11Device*>(rd->forwarder) : nullptr;
+            ID3D11DeviceContext* gameCtx = rd ? reinterpret_cast<ID3D11DeviceContext*>(rd->context) : nullptr;
+            const bool        sameDev = (gameDev == a_device);
+            const bool        sameCtx = (gameCtx == a_ctx);
+
+            logger::info("[Chain] drawing on {}x{} fmt={} ({}, 10bit={}), cbuffer {} B",
+                td.Width, td.Height, static_cast<int>(td.Format), FormatName(td.Format),
+                td.Format == DXGI_FORMAT_R10G10B10A2_UNORM, sizeof(Params));
+            if (haveDesc) {
+                logger::info("[Chain] swap chain: {} buffer(s), effect {}, windowed={}, hwnd=0x{:X}, refresh {}",
+                    sd.BufferCount, EffectName(sd.SwapEffect), sd.Windowed ? 1 : 0,
+                    reinterpret_cast<std::uintptr_t>(sd.OutputWindow),
+                    sd.BufferDesc.RefreshRate.Numerator);
+            }
+            logger::info("[Chain] device 0x{:X} vs RendererData 0x{:X} -> same={}", reinterpret_cast<std::uintptr_t>(a_device),
+                reinterpret_cast<std::uintptr_t>(gameDev), sameDev ? "YES" : "*** NO ***");
+            logger::info("[Chain] context 0x{:X} vs RendererData 0x{:X} -> same={}", reinterpret_cast<std::uintptr_t>(a_ctx),
+                reinterpret_cast<std::uintptr_t>(gameCtx), sameCtx ? "YES" : "*** NO ***");
+            if (!sameDev) {
+                logger::warn("[Chain] MISMATCH: the buffer we draw on does not belong to the device RendererData"
+                             " exposes. Drawing through the RendererData context would have gone nowhere -- that is"
+                             " exactly the v1.4.x 'we changed the back buffer, the screen never changed' symptom.");
+            }
+            // v1.3.1: the engine can own more than one render window / swap chain. Drawing on a chain
+            // that is rendered but never scanned out would be invisible while every other measurement
+            // still looks perfectly healthy -- so list all of them and mark the one we hold.
+            if (rd) {
+                int shown = 0;
+                for (int i = 0; i < 32 && shown < 4; ++i) {
+                    auto& w = rd->renderWindows[i];
+                    if (!w.swapChain) {
+                        continue;
+                    }
+                    ++shown;
+                    const bool ours = (reinterpret_cast<void*>(w.swapChain) == static_cast<void*>(a_sc));
+                    logger::info("[Chain] renderWindow[{}] hwnd=0x{:X} {}x{} swapChain=0x{:X}{}", i,
+                        reinterpret_cast<std::uintptr_t>(w.hWnd), w.windowWidth, w.windowHeight,
+                        reinterpret_cast<std::uintptr_t>(w.swapChain),
+                        ours ? "  <== the one we draw on" : "  (NOT the one we draw on)");
+                }
+                if (shown > 1) {
+                    logger::warn("[Chain] the engine owns {} render window(s) -- if the visible one is not ours,"
+                                 " nothing we draw can ever appear", shown);
+                }
+            }
+
+            // v1.3.2: WHO ELSE is on the present slots. `[Cap] chain below us … in SPS.dll` proved
+            // Skyrim Performance Solution sits downstream on slot 8. If slot 22 is still untouched
+            // DXGI code, submitting through it puts our pixels on screen after SPS has done its pass.
+            if (auto** vtbl = *reinterpret_cast<void***>(a_sc); vtbl) {
+                logger::info("[Chain] vtable[8]  Present  = 0x{:X} in {}", reinterpret_cast<std::uintptr_t>(vtbl[8]),
+                    vtbl[8] ? capprobe::ModuleOf(vtbl[8]) : "?");
+                logger::info("[Chain] vtable[22] Present1 = 0x{:X} in {}", reinterpret_cast<std::uintptr_t>(vtbl[22]),
+                    vtbl[22] ? capprobe::ModuleOf(vtbl[22]) : "?");
+            }
+            logger::info("[Chain] our orig Present  = 0x{:X} in {}",
+                reinterpret_cast<std::uintptr_t>(presentfreeze::g_origPresent),
+                presentfreeze::g_origPresent ? capprobe::ModuleOf(reinterpret_cast<const void*>(presentfreeze::g_origPresent)) : "?");
+            logger::info("[Chain] our orig Present1 = 0x{:X} in {}",
+                reinterpret_cast<std::uintptr_t>(presentfreeze::g_origPresent1),
+                presentfreeze::g_origPresent1 ? capprobe::ModuleOf(reinterpret_cast<const void*>(presentfreeze::g_origPresent1)) : "?");
+        }
+
+        // Which device the cached objects were created on. Borrowed, never AddRef'd: we only use it
+        // to notice that the device was replaced (resolution change, alt-tab, fullscreen toggle),
+        // because a resource created on the old device silently draws nothing on the new one.
+        ID3D11Device* g_resDevice = nullptr;
+
+        void ReleaseResources()
+        {
+            SafeRelease(g_vs);
+            SafeRelease(g_ps);
+            SafeRelease(g_cb);
+            SafeRelease(g_blend);
+            SafeRelease(g_raster);
+            SafeRelease(g_blitPs);
+            SafeRelease(g_alphaBlend);
+            SafeRelease(g_sampler);
+            SafeRelease(g_snapSrv);
+            SafeRelease(g_snapTex);
+            g_snapW = 0;
+            g_snapH = 0;
+            g_snapFmt = DXGI_FORMAT_UNKNOWN;
+            g_snapAt = 0;
+            g_resDevice = nullptr;
+        }
+
         bool EnsureResources(ID3D11Device* a_device)
         {
-            if (g_vs && g_ps && g_cb && g_blend && g_raster) {
-                return true;
-            }
             if (!a_device) {
                 return false;
+            }
+            if (g_resDevice && g_resDevice != a_device) {
+                logger::info("[Overlay] the D3D device changed -- rebuilding overlay resources");
+                ReleaseResources();
+            }
+            if (g_vs && g_ps && g_cb && g_blend && g_raster) {
+                return true;
             }
             if (FAILED(a_device->CreateVertexShader(g_VoidVS, sizeof(g_VoidVS), nullptr, &g_vs))) {
                 logger::warn("[Overlay] CreateVertexShader failed; overlay disabled");
@@ -3213,6 +4118,7 @@ namespace
                 g_failed.store(true);
                 return false;
             }
+            g_resDevice = a_device;
             logger::info("[Overlay] resources ready (VS {} B, PS {} B, additive blend, no depth)",
                 sizeof(g_VoidVS), sizeof(g_VoidPS));
             return true;
@@ -3353,26 +4259,62 @@ namespace
         bool Render(void* a_swapChain, Params a_params)
         {
             using namespace RE::BSGraphics;
-            auto* rd = Renderer::GetRendererData();
-            auto* device = rd ? reinterpret_cast<ID3D11Device*>(rd->forwarder) : nullptr;
-            auto* ctx = rd ? reinterpret_cast<ID3D11DeviceContext*>(rd->context) : nullptr;
-            if (!device || !ctx || !a_swapChain) {
-                logger::warn("[Overlay] renderer device/context/swap chain unavailable; overlay disabled for this session");
-                g_failed.store(true);
-                return false;
-            }
-            if (!EnsureResources(device)) {
+            if (!a_swapChain) {
                 return false;
             }
             auto* sc = static_cast<IDXGISwapChain*>(a_swapChain);
+            // v1.8.7: draw into the buffer this chain is about to present, not blindly into 0.
+            const std::uint32_t bbIndex = presentfreeze::CurrentBackBufferIndex(sc);
             ID3D11Texture2D* backBuffer = nullptr;
-            if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backBuffer))) || !backBuffer) {
-                logger::warn("[Overlay] swap chain GetBuffer(0) failed; overlay disabled for this session");
+            if (FAILED(sc->GetBuffer(bbIndex, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backBuffer))) || !backBuffer) {
+                // v1.10.2: do NOT latch on one failure. A swap chain resize (alt-tab, resolution or
+                // fullscreen change) makes GetBuffer fail once, and the old code then disabled the
+                // overlay for the rest of the session -- the effect silently died after any alt-tab.
+                const auto fails = g_transientFailures.fetch_add(1) + 1;
+                if (fails >= 30) {
+                    logger::warn("[Overlay] GetBuffer({}) failed {} times in a row; overlay disabled for this session", bbIndex, fails);
+                    g_failed.store(true);
+                }
+                return false;
+            }
+            g_transientFailures.store(0);
+            // v1.3.0: derive the device and the immediate context FROM THE BUFFER WE ARE ABOUT TO
+            // DRAW ON, instead of trusting RendererData. On a vanilla install both are the same
+            // object, but the test setup runs ReShade (as dxgi.dll) and Community Shaders at once, and
+            // "we verifiably changed the back buffer yet the screen never changed" is precisely what
+            // a device/chain mismatch looks like. Deriving both from the buffer makes a mismatch
+            // impossible by construction. The one-shot [Chain] line below reports whether the two
+            // ever disagreed -- if they did, that was the bug all along.
+            ID3D11Device* device = nullptr;
+            backBuffer->GetDevice(&device);
+            ID3D11DeviceContext* ctx = nullptr;
+            if (!device) {
+                SafeRelease(backBuffer);
+                logger::warn("[Overlay] back buffer reports no device; overlay disabled for this session");
                 g_failed.store(true);
+                return false;
+            }
+            device->GetImmediateContext(&ctx);
+            if (!ctx) {
+                device->Release();
+                SafeRelease(backBuffer);
+                logger::warn("[Overlay] back buffer device has no immediate context; overlay disabled");
+                g_failed.store(true);
+                return false;
+            }
+            if (!g_chainLogged.exchange(true)) {
+                LogChain(sc, backBuffer, device, ctx);
+            }
+            if (!EnsureResources(device)) {
+                ctx->Release();
+                device->Release();
+                SafeRelease(backBuffer);
                 return false;
             }
             ID3D11RenderTargetView* rtv = nullptr;
             if (FAILED(device->CreateRenderTargetView(backBuffer, nullptr, &rtv)) || !rtv) {
+                ctx->Release();
+                device->Release();
                 SafeRelease(backBuffer);
                 logger::warn("[Overlay] CreateRenderTargetView failed; overlay disabled for this session");
                 g_failed.store(true);
@@ -3383,10 +4325,90 @@ namespace
             a_params.resolution[0] = static_cast<float>(desc.Width);
             a_params.resolution[1] = static_cast<float>(desc.Height);
 
-            // ---- cross-fade snapshot (v1.4.7) --------------------------------------------
-            // Keep a copy of the frame as it looks BEFORE the cut. During the dead window it is
-            // static, so one copy every 400 ms is plenty and costs nothing visible.
-            if (g_config.crossFade && g_blitPs && g_alphaBlend && g_sampler) {
+            // ---- v1.3.0 probe: one glance, binary answer -------------------------------------
+            // Flood the whole target with saturated magenta and present it. No post-processing
+            // chain (ReShade, Community Shaders, ENB) can swallow a full-screen primary colour, so
+            // this separates "our drawing never reaches the display" from "our drawing is just too
+            // subtle to see" with no argument left. If the screen stays unchanged while this runs,
+            // every Present-layer idea is dead and only a Fader/Mist takeover is left.
+            const int vm = g_cfgVisualMode.load(std::memory_order_relaxed);
+            if ((vm == 3 || vm == 6 || vm == 7 || vm == 8) && g_probeLeft.load(std::memory_order_relaxed) > 0) {
+                const float magenta[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+                ctx->ClearRenderTargetView(rtv, magenta);
+                if (vm == 7 || vm == 8) {
+                    // v1.8.8: the index we pick can be wrong, and the log says so -- `authority n/a`
+                    // means IDXGISwapChain3 is not reachable on this chain, so the index falls back to
+                    // GetLastPresentCount() % BufferCount, and [PA] shows that counter does not advance
+                    // synchronously with our call. Flooding EVERY back buffer takes the guess out of
+                    // the experiment completely: whichever buffer the chain presents next is magenta.
+                    // If the screen stays clean with all of them flooded, buffer selection is not the
+                    // answer and slot 8 genuinely cannot deliver our pixels.
+                    DXGI_SWAP_CHAIN_DESC scDescAll{};
+                    const UINT buffers = SUCCEEDED(sc->GetDesc(&scDescAll)) ? scDescAll.BufferCount : 1u;
+                    for (UINT i = 0; i < buffers; ++i) {
+                        ID3D11Texture2D* other = nullptr;
+                        if (FAILED(sc->GetBuffer(i, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&other))) || !other) {
+                            continue;
+                        }
+                        ID3D11RenderTargetView* ortv = nullptr;
+                        if (SUCCEEDED(device->CreateRenderTargetView(other, nullptr, &ortv)) && ortv) {
+                            ctx->ClearRenderTargetView(ortv, magenta);
+                            SafeRelease(ortv);
+                        }
+                        SafeRelease(other);
+                    }
+                    if (!g_probeAllBuffersLogged.exchange(true)) {
+                        logger::info("[Probe] mode {}: flooded ALL {} back buffer(s) magenta -- whichever one"
+                                     " gets presented is magenta, so `no change on screen` now means the"
+                                     " pixels are lost after us, not that we picked the wrong buffer", vm, buffers);
+                    }
+                }
+                if (vm == 6) {
+                    // submit this frame through slot 22 so SPS on slot 8 cannot overwrite it
+                    presentfreeze::g_bypassToPresent1.store(true);
+                }
+                // v1.3.1: prove the clear actually landed on the buffer we are about to present.
+                // Magenta (1,0,1) scores exactly 170 in this sampler's 10-bit maths, so a read-back
+                // near 170 means "the pixels in OUR buffer changed". Anything else means the RTV or
+                // format path is broken and no effect of ours was ever drawn in the first place --
+                // a completely different problem from "it is drawn but not shown".
+                if (!g_probeReadbackDone.exchange(true)) {
+                    const float back = presentfreeze::SampleBackbufferLuma(a_swapChain);
+                    const bool isMagenta = (back > 150.0f && back < 190.0f);
+                    logger::info("[Probe] read-back after clear: luma {:.1f} -> {}", back,
+                        isMagenta ? "buffer IS magenta (the clear works; if the screen is not purple, the"
+                                    " presented buffer is not the one we cleared, or something downstream"
+                                    " overwrites it)"
+                                  : "NOT magenta -- the clear did not land on this buffer");
+                }
+                const auto left = g_probeLeft.fetch_sub(1) - 1;
+                if (left == 0) {
+                    logger::info("[Probe] magenta flood finished after {} frames ({} mode) -- did the screen turn magenta?",
+                        g_cfgProbeFrames.load(), vm == 6 ? "slot-22 submit" : (vm == 7 ? "all-buffer flood, slot 8" : (vm == 8 ? "all-buffer flood + post-present read-back" : "normal submit")));
+                    // stop submitting through slot 22 again -- it is a probe, not the normal path
+                    presentfreeze::g_bypassToPresent1.store(false);
+                    Disarm("probe finished");
+                } else if (left % 30 == 0) {
+                    logger::info("[Probe] magenta flood: {} frames left", left);
+                }
+                SafeRelease(rtv);
+                ctx->Release();
+                device->Release();
+                SafeRelease(backBuffer);
+                return true;
+            }
+
+            // ---- frozen-frame snapshot -------------------------------------------------------
+            // ONE texture serves all three jobs: the dead-window push-in, the cut cross-fade, and
+            // the "is there actually a picture here?" gate.
+            // Sampling is throttled to ~10 Hz because a staging read-back is a full GPU sync, and a
+            // copy only happens when the picture really changed -- during the dead window it never
+            // changes, so one copy covers the whole window.
+            // A frame is only ever promoted to "the snapshot" when its luma says it has a picture in
+            // it. Storing a near-black frame is how a cross-fade turns into "it goes black for a
+            // moment", which is the exact report that retired the previous attempt.
+            const bool haveBlitRes = g_blitPs && g_alphaBlend && g_sampler;
+            if (haveBlitRes) {
                 if (!g_snapTex || g_snapW != desc.Width || g_snapH != desc.Height || g_snapFmt != desc.Format) {
                     SafeRelease(g_snapSrv);
                     SafeRelease(g_snapTex);
@@ -3403,19 +4425,45 @@ namespace
                         g_snapH = desc.Height;
                         g_snapFmt = desc.Format;
                         g_snapAt = 0;
+                        g_snapValid = false;
+                        g_snapSampleAt = 0;
                     } else {
                         SafeRelease(g_snapSrv);
                         SafeRelease(g_snapTex);
-                        logger::warn("[Overlay] snapshot texture creation failed; cross-fade disabled");
+                        logger::warn("[Overlay] snapshot texture creation failed; frozen-frame pass disabled");
                     }
                 }
-                if (g_snapTex && a_params.blitAlpha <= 0.0f && !g_cut.load(std::memory_order_relaxed)) {
-                    // Copy EVERY frame of the dead window. A 400 ms timer could land on the one
-                    // near-black frame right after suppression, and then the "cross-fade" would be
-                    // fading BLACK over the new cell -- exactly the "it goes black for a moment"
-                    // report. The last pre-cut frame is by definition the static old picture.
-                    ctx->CopyResource(g_snapTex, backBuffer);
-                    g_snapAt = NowMs();
+                const std::int64_t nowMs = NowMs();
+                const std::int64_t deadStart = g_deadWindowAt.load();
+                const bool inDead = (deadStart > 0) && !g_cut.load(std::memory_order_relaxed);
+                if (g_snapTex && !g_cut.load(std::memory_order_relaxed) && nowMs - g_snapSampleAt >= 100) {
+                    g_snapSampleAt = nowMs;
+                    const float luma = presentfreeze::SampleBackbufferLuma(a_swapChain);
+                    // The luma gate is not an optimisation, it is the safety rule: the frame right
+                    // after suppression is near-black (luma 3.8), and storing THAT as "the frozen
+                    // picture" is exactly how a cross-fade becomes "it went black for a moment".
+                    // A frame below the gate can never replace a good snapshot.
+                    if (luma > 6.0f) {
+                        // v1.10.6: "the LAST good frame", not "the brightest one".
+                        // v1.10.5 kept the brightest frame of the transition, which fixed the dark
+                        // frosted glass but broke continuity: the brightest frame can come from the
+                        // middle of the door animation, so the frozen picture no longer matched the
+                        // animation's final frame and the hand-off visibly jumped.
+                        // The rule that gives both: keep replacing while the frame is still within 85%
+                        // of the brightest seen so far (i.e. it is still "the picture", not the fade),
+                        // and FREEZE the moment it drops below that -- which is the last frame before
+                        // the engine started dimming, i.e. exactly the animation's last frame.
+                        if (luma > g_snapMaxLuma) {
+                            g_snapMaxLuma = luma;
+                        }
+                        const bool stillThePicture = (luma >= g_snapMaxLuma * 0.85f);
+                        if (!g_snapValid || stillThePicture) {
+                            ctx->CopyResource(g_snapTex, backBuffer);
+                            g_snapLuma = luma;
+                            g_snapAt = nowMs;
+                        }
+                        g_snapValid = true;
+                    }
                 }
             }
 
@@ -3444,20 +4492,46 @@ namespace
             ctx->VSSetConstantBuffers(0, 1, &g_cb);
             ctx->PSSetConstantBuffers(0, 1, &g_cb);
 
-            const bool wantFade = (a_params.blitAlpha > 0.0f);
-            const bool haveFadeRes = g_blitPs && g_alphaBlend && g_snapSrv && g_sampler;
-            if (wantFade && !haveFadeRes && !g_fadeResWarned.exchange(true)) {
-                logger::warn("[Overlay] cross-fade requested but resources missing (blitPs={} blend={} srv={} sampler={}) -- drawing the motes instead",
-                    g_blitPs != nullptr, g_alphaBlend != nullptr, g_snapSrv != nullptr, g_sampler != nullptr);
+            const bool wantBlit = (a_params.blitAlpha > 0.0f);
+            const bool haveBlit = wantBlit && haveBlitRes && g_snapSrv && g_snapValid;
+            if (wantBlit && !haveBlit && !g_fadeResWarned.exchange(true)) {
+                logger::warn("[Overlay] frozen-frame pass wanted but not possible (blitPs={} blend={} srv={} sampler={} snapValid={}, zoom={:.3f}) -- drawing the additive layer instead",
+                    g_blitPs != nullptr, g_alphaBlend != nullptr, g_snapSrv != nullptr, g_sampler != nullptr,
+                    g_snapValid, a_params.zoom);
             }
-            const bool fading = wantFade && haveFadeRes;
-            if (fading) {
-                // The old frame, 1:1, dissolving into the finished cell. 350 ms.
+            if (haveBlit) {
+                // v1.3.3: THIS is the frame that carries our pixels, so it must not travel through
+                // slot 8. Measured chain:  game -> SPS -> us -> DebugMenu -> real Present, and a
+                // full-screen magenta written in front of slot 8 never reaches the screen. The same
+                // magenta submitted through slot 22 (game -> us -> sl.interposer -> real Present)
+                // does. So only the frames we actually draw on bypass; every other frame stays on
+                // the normal chain, and SPS keeps seeing the back buffer the way it expects.
+                // v1.8.7: pick the route for THIS frame by phase. See Config::submitRoute.
+                const int route = g_cfgSubmitRoute.load(std::memory_order_relaxed);
+                bool bypass = false;
+                if (route == 2) {
+                    bypass = true;                                    // slot 22 on every drawn frame
+                } else if (route == 1) {
+                    bypass = !g_cut.load(std::memory_order_relaxed);   // static dead window only
+                } else {
+                    bypass = g_cfgUsePresent1.load(std::memory_order_relaxed);
+                }
+                if (bypass && presentfreeze::g_suppressPresent.load(std::memory_order_relaxed)) {
+                    // The frame is drawn and then thrown away by our own gate below, so the bypass
+                    // buys nothing. Log it once per arm: otherwise "the pixels never appeared" gets
+                    // blamed on the present chain when the chain was never even asked.
+                    if (!g_bypassBlockedBySuppress.exchange(true)) {
+                        logger::warn("[Overlay] bypass requested, but present suppression is ON -- this frame is"
+                                     " drawn and then dropped by our own gate, not by the chain below us");
+                    }
+                }
+                presentfreeze::g_bypassToPresent1.store(bypass);
                 ctx->OMSetBlendState(g_alphaBlend, nullptr, 0xFFFFFFFFu);
                 ctx->PSSetShader(g_blitPs, nullptr, 0);
                 ctx->PSSetShaderResources(0, 1, &g_snapSrv);
                 ctx->PSSetSamplers(0, 1, &g_sampler);
             } else {
+                presentfreeze::g_bypassToPresent1.store(false);
                 ctx->PSSetShader(g_ps, nullptr, 0);
             }
 
@@ -3468,24 +4542,56 @@ namespace
                 ctx->Draw(3, 0);
             }
 
+            // v1.10.8: route 3 presents the same frame twice (slot 8 for the upscaler's cadence, then
+            // slot 22 so ours lands). But FLIP_DISCARD rotates the back buffer on every Present, so the
+            // second Present flips the OTHER buffer -- which never received our drawing. Result on the
+            // first attempt: the flash went away (the upscaler was fed) and the effect went away too
+            // (our pixels were replaced by the untouched buffer). Fix: after drawing, mirror this exact
+            // frame into every other back buffer, so whichever Present lands last carries it.
             if (selfCheck) {
                 const float meanAfter = MeanOfBackbuffer(device, ctx, backBuffer);
                 logger::info("[Overlay] self-check: backbuffer mean {:.2f} -> {:.2f} (delta {:+.2f}); {}",
                     meanBefore, meanAfter, meanAfter - meanBefore,
-                    fading ? "cross-fade pass" : "motes pass");
+                    haveBlit ? "frozen-frame pass" : "additive pass");
             }
 
             saved.Put(ctx);
             SafeRelease(rtv);
+            ctx->Release();
+            device->Release();
             SafeRelease(backBuffer);
             return true;
         }
 
         void Arm()
         {
-            if (!g_config.voidOverlay || g_failed.load()) {
+            // v1.3.0: iVisualMode is the single authority. bVoidOverlay used to gate the whole
+            // overlay and defaults to 0, which is why every visual experiment since v1.4 was silently
+            // doing nothing unless two switches were flipped. Now: iVisualMode != 0 arms for real.
+            if (g_config.visualMode == 0 || g_failed.load()) {
                 return;
             }
+            g_cfgVisualMode.store(g_config.visualMode);
+            g_cfgDeadZoomAmount.store(g_config.deadZoomAmount);
+            g_cfgDeadBlurPx.store(g_config.deadBlurPx);
+            g_cfgDeadZoomMs.store(g_config.deadZoomMs);
+            g_cfgProbeFrames.store(g_config.probeFrames);
+            g_cfgUsePresent1.store(g_config.usePresent1ForVisual);
+            g_cfgSubmitRoute.store(g_config.submitRoute);
+            g_cfgPresentAudit.store(g_config.presentAudit);
+            g_probeLeft.store((g_config.visualMode == 3 || g_config.visualMode == 6 ||
+                               g_config.visualMode == 7 || g_config.visualMode == 8)
+                                  ? static_cast<int>(g_config.probeFrames)
+                                  : 0);
+            g_postProbeLeft.store(g_config.visualMode == 4 ? static_cast<int>(g_config.probeFrames) : 0);
+            presentfreeze::g_bypassToPresent1.store(false);
+            g_probeReadbackDone.store(false);
+            g_probeAllBuffersLogged.store(false);
+            g_survivalLeft.store(g_config.visualMode == 8 ? g_config.probeFrames : 0);
+            g_survivalTick.store(0);
+            g_bypassBlockedBySuppress.store(false);
+            g_presentHrLogged.store(false);
+            g_lastPresentHr.store(0);
             g_cfgBright.store(g_config.overlayBrightness);
             g_cfgBreath.store(g_config.overlayBreath);
             g_cfgPulse.store(g_config.overlayPulse);
@@ -3494,13 +4600,22 @@ namespace
             g_cfgPulseMs.store(g_config.overlayPulseMs);
             g_cfgCrossFade.store(g_config.crossFade);
             g_cfgCrossFadeMs.store(g_config.crossFadeMs);
+            g_cfgCrossFadeHoldMs.store(g_config.crossFadeHoldMs);
             g_cfgDebugFull.store(g_config.overlayDebugFullscreen);
             g_snapAt = 0;   // force a fresh snapshot for this transition
+            g_snapValid = false;
+            g_snapLuma = -1.0f;
+            g_snapMaxLuma = -1.0f;
+            g_snapSampleAt = 0;
             g_fadeLogged.store(false);
             g_selfCheckLeft.store(5);   // 前 5 帧做读回自检
             g_cfgMaxMs.store(g_config.overlayMaxMs);
             g_armAt.store(NowMs());
             g_cutAt.store(0);
+            g_cutBaseLuma.store(-1.0f);
+            g_dissolveAt.store(0);
+            g_lastCutSample.store(0);
+            g_prevCutLuma.store(-1.0f);
             g_cut.store(false);
             g_draws.store(0);
             g_lastDrawAt.store(0);
@@ -3513,9 +4628,15 @@ namespace
                 logger::warn("[Overlay] no swap chain yet; the first transition will go without the overlay");
             }
             if (!g_armed.exchange(true)) {
-                logger::info("[Overlay] armed: {} motes, brightness {:.2f}, breathing {:.3f}, pulse {:.2f}/{} ms, cap {} ms",
-                    g_cfgMotes.load(), g_cfgBright.load(), g_cfgBreath.load(), g_cfgPulse.load(),
-                    g_cfgPulseMs.load(), g_cfgMaxMs.load());
+                logger::info("[Overlay] armed mode {}: push-in {:.1f}% over {} ms, cut cross-fade {} ms, probe {} frames",
+                    g_config.visualMode, g_config.deadZoomAmount * 100.0f, g_config.deadZoomMs,
+                    g_config.crossFadeMs, g_config.probeFrames);
+                logger::info("[Overlay] submit route {} ({}) / present audit {}",
+                    g_config.submitRoute,
+                    g_config.submitRoute == 1 ? "slot 22 while the dead window is static, slot 8 from the cut on"
+                    : g_config.submitRoute == 2 ? "slot 22 on every drawn frame -- v1.8.4 route, expected to freeze at the cut"
+                                                : "slot 8 only (bUsePresent1ForVisual decides)",
+                    g_config.presentAudit ? 1 : 0);
             }
         }
 
@@ -3528,11 +4649,55 @@ namespace
             }
             const std::int64_t now = NowMs();
             g_cutAt.store(now);
+            g_cutBaseLuma.store(-1.0f);
+            g_dissolveAt.store(0);
+            g_lastCutSample.store(0);
+            g_prevCutLuma.store(-1.0f);
+            g_waitCapLogged.store(false);
             g_cut.store(true);
-            logger::info("[Overlay] cut after {} ms: {} starting ({} frames drawn, {} Present calls in the dead window)",
+            if (g_config.cancelFadeBackAfterCut) {
+                // v1.10.4 experiment: after the swap, cancel ALL three fade forms -- including
+                // FadeToBlackBackImod, which we normally leave alone because cancelling it mid-transition
+                // restarts the engine's fade-in every 25 ms and strobes. After the cut the trade-off may
+                // be the other way round: if the still picture is a black plane held at partial strength,
+                // this removes it. Bounded to 1.5 s, and posted to the main thread so the render thread
+                // never touches engine state.
+                std::thread([]() {
+                    for (int i = 0; i < 60; ++i) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                        if (auto* task = SKSE::GetTaskInterface()) {
+                            task->AddTask([]() {
+                                CacheForms();
+                                if (g_fadeImod) {
+                                    RE::ImageSpaceModifierInstanceForm::Stop(g_fadeImod);
+                                }
+                                if (g_fadeHoldImod) {
+                                    RE::ImageSpaceModifierInstanceForm::Stop(g_fadeHoldImod);
+                                }
+                                if (g_fadeBackImod) {
+                                    RE::ImageSpaceModifierInstanceForm::Stop(g_fadeBackImod);
+                                }
+                            });
+                        }
+                    }
+                }).detach();
+                logger::info("[NoBlack] bCancelFadeBackAfterCut=1: cancelling ALL fade records for 1.5 s after the cut");
+            }
+            logger::info("[Overlay] cut after {} ms: {} starting ({} frames drawn, {} Present calls in the dead window, snapshot valid={})",
                 now - g_armAt.load(),
-                g_cfgCrossFade.load() ? "cross-fade" : "pulse",
-                g_draws.load(), g_presentSeen.load());
+                g_cfgVisualMode.load() == 0 ? "nothing" : "cross-fade",
+                g_draws.load(), g_presentSeen.load(), g_snapValid);
+            // v1.10.3: the blur ramps over uDeadZoomMs but the dead window is only as long as the
+            // transition -- set the ramp too long and the blur never reaches full strength, which
+            // looks like "the frosted glass is barely there" with no obvious cause.
+            const auto rampMs = g_cfgDeadZoomMs.load(std::memory_order_relaxed);
+            const auto deadMs = now - g_deadWindowAt.load();
+            if (g_deadWindowAt.load() != 0 && rampMs > 0 && deadMs < static_cast<std::int64_t>(rampMs)) {
+                logger::warn("[Overlay] the blur ramp is {} ms but the dead window was only {} ms -- it reached"
+                             " {}% of fDeadBlurPx. Lower uDeadZoomMs for the full effect.",
+                    rampMs, deadMs,
+                    static_cast<int>(100 * deadMs / static_cast<std::int64_t>(rampMs)));
+            }
         }
 
         void Disarm(const char* a_reason)
@@ -3540,6 +4705,13 @@ namespace
             if (!g_armed.exchange(false)) {
                 return;
             }
+            // v1.8.7: the submit route must never outlive the overlay. This flag is only safe inside
+            // the static dead window; left as `true` it would send every ordinary gameplay frame
+            // around slot 8 for the rest of the session, straight into the frame-generation path
+            // that wedged the chain in v1.8.4. Disarm is reached on every exit path -- hard cap,
+            // failed transition, finished cross-fade -- so this is the one place that always runs.
+            presentfreeze::g_bypassToPresent1.store(false);
+            g_bypassBlockedBySuppress.store(false);
             const std::int64_t now = NowMs();
             logger::info("[Overlay] off after {} ms, {} frames drawn, {} Present calls seen ({})",
                 now - g_armAt.load(), g_draws.load(), g_presentSeen.load(), a_reason ? a_reason : "?");
@@ -3559,10 +4731,91 @@ namespace
             }
         }
 
+        // v1.3.1: records the return value of the REAL Present, once per transition.
+        // Returns true only for the first call after arming, so the caller logs exactly one line.
+        bool NotePresentResult(long a_hr)
+        {
+            if (!g_armed.load(std::memory_order_relaxed) || g_presentHrLogged.exchange(true)) {
+                return false;
+            }
+            g_lastPresentHr.store(a_hr);
+            return true;
+        }
+
+        // ---- v1.3.1 mode 4: the same flood, but AFTER the real Present --------------------------
+        // This is the experiment that tells the two remaining explanations apart:
+        //   * if a flood drawn BEFORE Present never shows, while the same flood drawn AFTER Present
+        //     and presented again DOES show, then something between us and the scan-out
+        //     (ReShade / Community Shaders / the engine's own late pass) rewrites the buffer and
+        //     discards our pixels. The fix is then "draw where they cannot overwrite", not
+        //     "give up on Present".
+        //   * if neither shows, the buffer we hold is not the one being scanned out at all.
+        // Cost: one extra Present per frame for the probe window only; it is a diagnostic, never a
+        // shipped effect.
+        bool WantsPostPresentProbe()
+        {
+            return g_postProbeLeft.load(std::memory_order_relaxed) > 0;
+        }
+
+        // ---- v1.3.2 mode 6: submit through IDXGISwapChain1::Present1 (slot 22) -------------------
+        // `[Cap] chain below us … in SPS.dll` proved that Skyrim Performance Solution sits downstream
+        // of us on slot 8: it re-renders the whole frame from its own cached state before calling the
+        // real Present, so anything we draw is discarded no matter where in slot 8 we draw.
+        // SPS needs slot 8 because it consumes the previous frame; it has no reason to touch slot 22.
+        // If slot 22 is still the untouched DXGI entry point, submitting through it puts our pixels on
+        // screen AFTER SPS has done its pass.
+        bool BypassToPresent1()
+        {
+            return presentfreeze::g_bypassToPresent1.load(std::memory_order_relaxed);
+        }
+
+
+        void PostPresentProbe(void* a_swapChain)
+        {
+            if (!a_swapChain || g_postProbeLeft.load(std::memory_order_relaxed) <= 0) {
+                return;
+            }
+            auto* sc = static_cast<IDXGISwapChain*>(a_swapChain);
+            ID3D11Texture2D* back = nullptr;
+            if (FAILED(sc->GetBuffer(presentfreeze::CurrentBackBufferIndex(sc), __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back))) || !back) {
+                return;
+            }
+            ID3D11Device* device = nullptr;
+            back->GetDevice(&device);
+            ID3D11DeviceContext* ctx = nullptr;
+            if (device) {
+                device->GetImmediateContext(&ctx);
+            }
+            if (device && ctx) {
+                ID3D11RenderTargetView* rtv = nullptr;
+                if (SUCCEEDED(device->CreateRenderTargetView(back, nullptr, &rtv)) && rtv) {
+                    const float magenta[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+                    ctx->ClearRenderTargetView(rtv, magenta);
+                    rtv->Release();
+                    const auto left = g_postProbeLeft.fetch_sub(1) - 1;
+                    if (left % 30 == 0 || left == 0) {
+                        logger::info("[Probe] post-Present flood: {} frames left (this one is presented after the"
+                                     " real Present -- if only THIS is visible, something downstream rewrites the"
+                                     " buffer)", left);
+                    }
+                }
+            }
+            if (ctx) {
+                ctx->Release();
+            }
+            if (device) {
+                device->Release();
+            }
+            back->Release();
+        }
+
         // Called from the Present hook on the render thread.
         void OnPresent(void* a_swapChain)
         {
             if (!a_swapChain || !g_armed.load(std::memory_order_relaxed) || g_failed.load(std::memory_order_relaxed)) {
+                // v1.8.7 belt-and-braces: while the overlay is not drawing, the submit route must be
+                // slot 8. One load per frame is nothing next to holding the whole render thread.
+                presentfreeze::g_bypassToPresent1.store(false);
                 return;
             }
             const std::int64_t now = NowMs();
@@ -3579,47 +4832,163 @@ namespace
 
             Params p{};
             p.age = static_cast<float>(now - armAt) / 1000.0f;
-            const bool         fading = g_cfgCrossFade.load();
-            const std::uint32_t tailMs = fading ? g_cfgCrossFadeMs.load() : g_cfgPulseMs.load();
+            const int           mode = g_cfgVisualMode.load(std::memory_order_relaxed);
+            const std::uint32_t fadeMs = g_cfgCrossFadeMs.load();
+            const float         zoomAmount = g_cfgDeadZoomAmount.load();
+            const std::uint32_t zoomMs = g_cfgDeadZoomMs.load();
+            const float         blurMaxPx = g_cfgDeadBlurPx.load();
+            p.zoom = 1.0f;
+            p.blurPx = 0.0f;
+
             if (g_cut.load(std::memory_order_relaxed)) {
+                // ---- after the cut: the old frame dissolves into the finished cell --------------
                 const std::int64_t cutAt = g_cutAt.load();
                 const std::int64_t cutAge = now - cutAt;
-                if (cutAge > static_cast<std::int64_t>(tailMs)) {
-                    g_lastDrawAt.store(now);
-                    Disarm(fading ? "cross-fade finished" : "pulse finished");
-                    return;
+                const std::uint32_t holdCapMs = g_cfgCrossFadeHoldMs.load(std::memory_order_relaxed);
+                // v1.10.3: the dissolve no longer starts on a stopwatch -- it starts when the engine
+                // actually unveils the new picture (or when holdCapMs runs out, whichever is first).
+                // See the g_cutBaseLuma comment above for the measurement that forced this.
+                {
+                    const std::int64_t dStart = g_dissolveAt.load();
+                    if (dStart == 0) {
+                        if (cutAge >= 60) {   // let the swap itself settle before taking a baseline
+                            const float luma = presentfreeze::SampleBufferLumaAt(a_swapChain, 0xFFFFFFFFu);
+                            if (luma >= 0.0f) {
+                                g_cutBaseLuma.store(luma);
+                            }
+                            // Provisional start = the cap, so the worst case is the old behaviour.
+                            g_dissolveAt.store(cutAt + static_cast<std::int64_t>(holdCapMs));
+                        }
+                    } else if (now - g_lastCutSample.load() >= 50) {
+                        g_lastCutSample.store(now);
+                        const float     luma = presentfreeze::SampleBufferLumaAt(a_swapChain, 0xFFFFFFFFu);
+                        const float     base = g_cutBaseLuma.load();
+                        // v1.10.4: print the engine's own brightness through the whole hand-off. This is
+                        // the line that tells "a black plane is still on the screen" apart from "the new
+                        // cell really is that dark": a constant value = a static cover, a ramp = a fade.
+                        logger::info("[Cut] +{} ms engineLuma={:.1f} (baseline {:.1f}) alpha={:.2f}", cutAge,
+                            luma, base, (fadeMs > 0 && dStart != 0)
+                                ? std::clamp(1.0f - static_cast<float>(now - dStart) / static_cast<float>(fadeMs), 0.0f, 1.0f)
+                                : 1.0f);
+                        // v1.10.5: the engine keeps presenting a BLACK frame for a while after the
+                        // swap (measured luma 2.0 for >2 s on this setup), and the real picture only
+                        // arrives later -- as a step. Dissolving on a 1.5 s stopwatch therefore faded
+                        // our picture into black, and the real frame then landed with nothing covering
+                        // it: the "猛亮一下". So start only when the engine's frame is BOTH not black
+                        // (the picture exists) and STABLE (no longer changing between samples), which
+                        // also rides out the first over-bright frames.
+                        // v1.11.0: start the dissolve as soon as the engine's picture EXISTS (not black).
+                        // The old "and settled" test compared two samples 50 ms apart, which a moving
+                        // picture passes trivially -- it released the moment it first ran, so the wait
+                        // value could not be tuned at all. Non-black alone is the property we care about:
+                        // it is what stops the dissolve from fading into the dark frame the engine shows
+                        // right after the swap.
+                        const float prevLuma = g_prevCutLuma.exchange(luma);
+                        if (cutAge < static_cast<std::int64_t>(holdCapMs) && luma > 12.0f) {
+                            g_dissolveAt.store(now);
+                            logger::info("[Overlay] cut: the engine's picture is back at +{} ms"
+                                         " (luma {:.1f}, was {:.1f}); dissolving over {} ms",
+                                cutAge, luma, prevLuma, fadeMs);
+                        }
+                    }
+                    const std::int64_t dNow = g_dissolveAt.load();
+                    if (dNow != 0 && dNow == cutAt + static_cast<std::int64_t>(holdCapMs) &&
+                        cutAge >= static_cast<std::int64_t>(holdCapMs) && g_prevCutLuma.load() <= 12.0f &&
+                        !g_waitCapLogged.exchange(true)) {
+                        logger::warn("[Overlay] the engine was still black after the {} ms wait -- dissolving anyway"
+                                     " (raise uCrossFadeHoldMs if the flash persists)", holdCapMs);
+                    }
+                    if (dNow != 0 && now - dNow > static_cast<std::int64_t>(fadeMs)) {
+                        g_lastDrawAt.store(now);
+                        Disarm("cut cross-fade finished");
+                        return;
+                    }
                 }
                 p.phase = 1.0f;
                 p.phaseAge = static_cast<float>(cutAge) / 1000.0f;
-                if (fading && tailMs > 0) {
-                    // 1 -> 0 over crossFadeMs: the old frame dissolving into the finished cell.
-                    const float t = (p.phaseAge * 1000.0f) / static_cast<float>(tailMs);
-                    p.blitAlpha = (t >= 1.0f) ? 0.0f : (1.0f - t);
-                    p.pulseStrength = 0.0f;
+                // Hold the fully blurred picture across the dissolve: the hand-off then reads as
+                // frosted glass clearing up, rather than a still image sliding away.
+                p.blurPx = blurMaxPx;
+                // v1.9.0: carry the pushed-in scale ACROSS the cut. Leaving p.zoom at its default 1.000
+                // snapped the picture back a whole 3% on the exact frame of the swap, which is what made
+                // the whole transition read as a flash instead of a transition. Use the scale the dead
+                // window actually reached, so a short dead window does not pop inward either.
+                {
+                    float zoomAtCut = 1.0f;
+                    // Only mode 1 pushes the picture in, so only mode 1 has a scale to carry across.
+                    // In mode 2 the snapshot must appear pixel exact or it would pop outward here.
+                    const std::int64_t deadStartForCut = (mode == 1) ? g_deadWindowAt.load() : 0;
+                    if (deadStartForCut > 0) {
+                        const std::int64_t deadAgeAtCut = cutAt - deadStartForCut;
+                        const float td = (zoomMs > 0)
+                                             ? std::clamp(static_cast<float>(deadAgeAtCut) / static_cast<float>(zoomMs), 0.0f, 1.0f)
+                                             : 1.0f;
+                        zoomAtCut = 1.0f + zoomAmount * td;
+                    }
+                    p.zoom = zoomAtCut;
+                }
+                if (mode == 1 || mode == 2) {
+                    // v1.10.3: uCrossFadeMs now means exactly what the menu label says -- the length of
+                    // the dissolve. It used to be the TOTAL, with the hold subtracted from it, so setting
+                    // 800 with a 400 hold still only produced a 400 ms dissolve and the UI was lying.
+                    const std::int64_t dStart = g_dissolveAt.load();
+                    float tc = 0.0f;
+                    if (dStart != 0 && fadeMs > 0) {
+                        tc = std::clamp(static_cast<float>(now - dStart) / static_cast<float>(fadeMs), 0.0f, 1.0f);
+                    } else if (dStart != 0) {
+                        tc = 1.0f;
+                    }
+                    const float eased = tc * tc * (3.0f - 2.0f * tc);   // smoothstep
+                    p.blitAlpha = 1.0f - eased;
+                }
+                p.pulseStrength = 0.0f;
+            } else if (mode == 1) {
+                // ---- dead window: push the frozen picture in, so it stops being a still image ---
+                // Only once the loading menu has actually been dropped. Before that the engine is
+                // still drawing the door swing, and blitting a snapshot over it would freeze the
+                // door animation -- so blitAlpha stays 0 and we touch nothing at all.
+                const std::int64_t deadStart = g_deadWindowAt.load();
+                if (deadStart > 0) {
+                    const std::int64_t deadAge = now - deadStart;
+                    const float t = (zoomMs > 0)
+                                        ? std::clamp(static_cast<float>(deadAge) / static_cast<float>(zoomMs), 0.0f, 1.0f)
+                                        : 1.0f;
+                    p.zoom = 1.0f + zoomAmount * t;
+                    p.blurPx = blurMaxPx * t;
+                    // alpha 1: the snapshot replaces the frozen frame outright. That is the whole
+                    // point -- resampling it every frame is what produces the motion.
+                    p.blitAlpha = 1.0f;
                 }
             }
             p.bright = g_cfgBright.load();
-            p.breath = g_cfgBreath.load();
-            if (!(fading && p.phase >= 0.5f)) {
-                p.pulseStrength = g_cfgPulse.load();   // the cross-fade replaces the pulse in its window
-            }
-            p.motes = static_cast<float>(g_cfgMotes.load());
-            p.pulseMs = static_cast<float>(tailMs) / 1000.0f;
+            // v1.3.0: modes 1 and 2 are the frozen-frame blit and NOTHING else. Breathing / motes /
+            // pulse are the retired additive route -- leaving them at their old defaults would put a
+            // faint additive lift on every frame we do not blit (the whole door swing, for one),
+            // which both muddies the answer and is something the user never asked for.
+            const bool blitOnly = (mode == 1 || mode == 2 || mode == 4);
+            p.breath = blitOnly ? 0.0f : g_cfgBreath.load();
+            p.pulseStrength = blitOnly ? 0.0f : g_cfgPulse.load();
+            p.motes = blitOnly ? 0.0f : static_cast<float>(g_cfgMotes.load());
+            p.pulseMs = static_cast<float>(fadeMs) / 1000.0f;
             p.moteScale = g_cfgMoteScale.load();
-            if (g_cfgDebugFull.load() && p.phase < 0.5f) {
-                p.breath = 0.15f;   // full-screen additive lift -- impossible to miss if it reaches the screen
+            if (g_cfgDebugFull.load()) {
+                // A/B switch for the additive route: lift the WHOLE screen instead of blitting the
+                // snapshot. Kept because it is the cheapest way to answer "does a plain full-screen
+                // additive write reach the display?" without changing anything else.
+                p.blitAlpha = 0.0f;
+                p.breath = 0.15f;
                 p.motes = 0.0f;
                 p.pulseStrength = 0.0f;
             }
 
             g_lastDrawAt.store(now);
-            const bool firstFadeFrame = (p.blitAlpha > 0.0f) && !g_fadeLogged.exchange(true);
+            const bool firstBlitFrame = (p.blitAlpha > 0.0f) && !g_fadeLogged.exchange(true);
             if (!Render(a_swapChain, p)) {
                 return;
             }
-            if (firstFadeFrame) {
-                logger::info("[Overlay] cross-fade frame 1: snapshot age {} ms, alpha {:.2f}",
-                    g_snapAt ? (now - g_snapAt) : -1, p.blitAlpha);
+            if (firstBlitFrame) {
+                logger::info("[Overlay] frozen-frame pass frame 1: snapshot age {} ms, alpha {:.2f}, zoom {:.3f}",
+                    g_snapAt ? (now - g_snapAt) : -1, p.blitAlpha, p.zoom);
             }
             if (g_draws.fetch_add(1) == 0) {
                 logger::info("[Overlay] first frame drawn {:.0f} ms after arming", p.age * 1000.0f);
@@ -3647,14 +5016,19 @@ namespace
         logger::info("[B] freeze-frame ON ({}): presentation will stay on the last frame", a_reason);
         // Failsafe. Everything else may go wrong (the transition may never report back, the player
         // object may be null, a save may be loading), but the screen must never stay frozen forever.
-        const auto capMs = static_cast<std::int64_t>(g_config.transitionWindowMs) + 5000;
+        const auto activeWin = g_suppressWindowMs.load();
+        const auto winMs = activeWin > 0 ? activeWin : g_config.transitionWindowMs;
+        const auto capMs = static_cast<std::int64_t>(winMs) + 5000;
         std::thread([capMs]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(capMs));
-            if (!presentfreeze::g_suppressPresent.load()) {
+            if (g_shuttingDown.load(std::memory_order_acquire) || !presentfreeze::g_suppressPresent.load()) {
                 return;
             }
             if (auto* task = SKSE::GetTaskInterface()) {
                 task->AddTask([]() {
+                    if (g_shuttingDown.load(std::memory_order_acquire)) {
+                        return;
+                    }
                     if (presentfreeze::g_suppressPresent.exchange(false)) {
                         logger::warn("[B] freeze-frame force-disabled by the failsafe -- the transition never reported back");
                     }
@@ -3979,6 +5353,31 @@ namespace
         }
     }
 
+    int EffectiveSuppressMode()
+    {
+        // v1.2.6: mode 2 ("open the menu and hide its visuals") is retired. Measured: the menu being
+        // open does NOT pause the game (world kept running, freezeTime stayed off), and hiding the
+        // movie's visuals never took (background alpha was already 0; _visible=false left the smoke
+        // and the black in place) -- while leaving Menu_mc._visible=false behind made every LATER
+        // vanilla loading screen render without its text and spinner. So it is clamped to 1.
+        int mode = g_config.suppressMode;
+        if (mode < 0) {
+            mode = (g_config.suppressLoadingMenu || g_config.globalMenuSuppression) ? 1 : 0;
+        }
+        if (mode == 2) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                logger::warn("[Tier2] iSuppressMode=2 has been retired; running as mode 1 (menu suppression)");
+            }
+            mode = 1;
+        }
+        return mode;
+    }
+
+    // Mode 2: the menu is allowed to open -- kPausesGame and the engine's loading state machine keep
+    // working exactly as vanilla -- and we only take its visuals away. SetBackgroundAlpha(0) removes
+    // the black backdrop; the movie root ("Menu_mc") gets _visible=false so the smoke/model/text go too.
     void StopEngineBlack(const char* a_where)
     {
         CacheForms();
@@ -3989,6 +5388,38 @@ namespace
             RE::ImageSpaceModifierInstanceForm::Stop(g_fadeHoldImod);
         }
         logger::info("[NoBlack] stopped engine fade records ({})", a_where);
+    }
+
+    std::int64_t ComputeFallbackDelayMs(std::uint32_t a_windowMs, std::uint32_t a_cfgTimeoutMs)
+    {
+        const auto win = static_cast<std::int64_t>(a_windowMs);
+        const auto cfg = static_cast<std::int64_t>(a_cfgTimeoutMs);
+        const auto winMinus = win - 1500;   /* avoid std::max: windows.h defines a max macro */
+        return (win > 1500 && winMinus > cfg) ? winMinus : cfg;
+    }
+
+    bool HasPendingTransitionCompletedOnMainThread()
+    {
+        auto* pl = RE::PlayerCharacter::GetSingleton();
+        auto* cell = pl ? pl->GetParentCell() : nullptr;
+        if (!cell) {
+            return false;
+        }
+        const auto curID = cell->GetFormID();
+        const auto fromID = g_suppressFromCell.load();
+        const auto destID = g_suppressDestCell.load();
+        return (curID != fromID) || (destID != 0 && destID != fromID && curID == destID);
+    }
+
+    void DisarmTransitionStateOnMainThread(const char* a_reason)
+    {
+        g_suppressArmed.store(false);
+        g_suppressWanted.store(false);
+        g_menuWasSuppressed.store(false);
+        presentfreeze::g_holdActive.store(false);
+        voidoverlay::Disarm(a_reason);
+        ReleaseSwapBlack();
+        EndFreezeFrame();
     }
 
     RE::UI_MESSAGE_RESULTS HookedLoadingMenuProcessMessage(RE::IMenu* a_this, RE::UIMessage& a_msg)
@@ -4009,7 +5440,12 @@ namespace
             } else {
                 ArmLoadingMenuSuppression("global (menu requested outside the door hook)", true);
                 if (g_suppressArmed.load()) {
-                    g_menuWasSuppressed.store(true);
+                    if (!g_menuWasSuppressed.exchange(true)) {
+                        const auto fbDelay = ComputeFallbackDelayMs(
+                            g_suppressWindowMs.load(), g_config.suppressTimeoutMs);
+                        g_fallbackAt.store(NowMs() + fbDelay);
+                        g_deadWindowAt.store(NowMs());
+                    }
                     logger::info("[Tier2] LoadingMenu kShow suppressed by global mode");
                     return RE::UI_MESSAGE_RESULTS::kIgnore;
                 }
@@ -4017,17 +5453,47 @@ namespace
         }
         // v1.6.7: late request after the transition already finished -- eat it, and make sure any
         // loading menu that did manage to open is dismissed.
-        if (wantsShow && !g_suppressArmed.load() && NowMs() < g_graceSuppressUntil.load()) {
-            logger::info("[Tier2] late LoadingMenu request suppressed (post-cut grace window)");
+        if (wantsShow && !g_suppressArmed.load() && NowMs() < g_graceSuppressUntil.load() &&
+            g_suppressWanted.load() && g_graceEaten.load() < 2) {
+            g_graceEaten.fetch_add(1);
+            logger::info("[Tier2] late LoadingMenu request suppressed (post-cut grace, {}/2)", g_graceEaten.load());
             HideMenuIfOpen("Loading Menu");
             return RE::UI_MESSAGE_RESULTS::kIgnore;
         }
-        if (g_suppressArmed.load() && g_suppressWanted.load() && wantsShow) {
+        if (g_suppressArmed.load() && (g_suppressWanted.load() || g_menuWasSuppressed.load()) && wantsShow) {
+            // v1.2.1: main-thread fallback. The 25 ms watchdog cannot be relied on -- the main thread
+            // stops servicing AddTask ~0.6-0.75 s into a load -- so the "re-post the vanilla menu"
+            // safety net is evaluated HERE, on the thread that is actually running.
+            const auto fallbackAt = g_fallbackAt.load();
+            if ((fallbackAt != 0 && NowMs() > fallbackAt) || !g_suppressWanted.load()) {
+                if (HasPendingTransitionCompletedOnMainThread()) {
+                    logger::info("[Tier2] fallback skipped in menu hook: transition already completed -- ignoring late LoadingMenu");
+                    if (NowMs() > g_suppressDeadline.load()) {
+                        DisarmTransitionStateOnMainThread("late menu after transition already completed");
+                    }
+                    HideMenuIfOpen("Loading Menu");
+                    return RE::UI_MESSAGE_RESULTS::kIgnore;
+                }
+                const auto elapsed = NowMs() - g_suppressStarted.load();
+                const auto win = g_suppressWindowMs.load();
+                logger::info("[Tier2] suppression timeout reached in menu hook after {} ms (window {} ms, floor {} ms) -- letting the vanilla menu through",
+                    elapsed, win, g_config.suppressTimeoutMs);
+                DisarmTransitionStateOnMainThread("suppression timeout reached in menu hook");
+                return g_origLoadingProcessMessage ? g_origLoadingProcessMessage(a_this, a_msg)
+                                                   : RE::UI_MESSAGE_RESULTS::kPassOn;
+            }
             if (NowMs() <= g_suppressDeadline.load()) {
                 if (!g_menuWasSuppressed.exchange(true)) {
                     // First suppression of this transition: the re-post fallback is measured from
                     // here, not from the door activation.
-                    g_fallbackAt.store(NowMs() + static_cast<std::int64_t>(g_config.suppressTimeoutMs));
+                    // v1.3.4: the fallback is a safety net, so it must not fire before the window
+                    // we are willing to wait anyway. Derive it from the (possibly adapted) window.
+                    const auto fbDelay = ComputeFallbackDelayMs(
+                        g_suppressWindowMs.load(), g_config.suppressTimeoutMs);
+                    g_fallbackAt.store(NowMs() + fbDelay);
+                    // v1.3.0: this is the start of the dead window -- the picture on screen now
+                    // stops changing until the cut. The push-in is timed from here.
+                    g_deadWindowAt.store(NowMs());
                     // Raise the black NOW, roughly a second before the swap, so that the engine's
                     // scene-attach spin happens behind it instead of in front of it.
                     // v1.2.2: when a swap-time cover is configured, do NOT cover the whole load --
@@ -4040,14 +5506,64 @@ namespace
                 LogOpenMenus("menu suppression");
                 HideMenuIfOpen("Mist Menu");
                 StopEngineBlack("at menu suppression");
+                if (g_config.coverTest == 3) {
+                    SetRuntimeCoverAlpha(1.0f);
+                    logger::info("[CoverTest] cover up: UI layer, runtime clip (alpha 100)");
+                } else if (g_config.coverTest == 2) {
+                    // v1.13.0: UI-layer cover. Nothing is presented by us and no IMAD is touched --
+                    // our own Scaleform menu fades a fullscreen quad in, and the engine composites it
+                    // after upscaling. This is the route that cannot disturb the upscaler.
+                    SetCoverAlpha(1.0f);
+                    logger::info("[CoverTest] cover up: UI layer (alpha 100)");
+                } else if (g_config.coverTest == 1) {
+                    // v1.12.1 cover test: raise the engine's own fullscreen cover for the dead window.
+                    // Present is never touched, so the upscaler's sequence stays intact -- that is the
+                    // whole point of the test.
+                    //
+                    // Both records are needed. FadeToBlackImod is a FADE -- it ramps to black and then
+                    // ends, so on its own it produces exactly the "it goes black for a moment" that the
+                    // user reported. FadeToBlackHoldImod is the record the engine uses to STAY black.
+                    // Triggering only the first one was my mistake in v1.12.0.
+                    if (g_fadeImod) {
+                        RE::ImageSpaceModifierInstanceForm::Trigger(g_fadeImod, 1.0f, nullptr);
+                    }
+                    if (g_fadeHoldImod) {
+                        RE::ImageSpaceModifierInstanceForm::Trigger(g_fadeHoldImod, 1.0f, nullptr);
+                    }
+                    logger::info("[CoverTest] cover up: FadeToBlackImod + FadeToBlackHoldImod at full strength"
+                                 " (fade = {}{}, hold = {}{})",
+                        static_cast<const void*>(g_fadeImod), g_fadeImod ? "" : " MISSING",
+                        static_cast<const void*>(g_fadeHoldImod), g_fadeHoldImod ? "" : " MISSING");
+                }
+                if (g_config.coverTest == 4) {
+                    // v1.14.0: v1.13.4 proved that every always-open menu (HUD, Fader) is
+                    // kCustomRendering -- the engine never draws their movies -- and that the ONLY
+                    // normally-rendered menu is the Loading Menu itself. So instead of hiding it,
+                    // let it render and paint our own opaque quad on top of it.
+                    g_coverUiWanted.store(true);
+                    // v1.14.2 关键修正:必须在这里**同步**画上。
+                    // 实测(v1.14.1 日志):加载期间主线程不再处理 AddTask,周期任务里的重试要等到
+                    // 加载结束才第一次执行 —— 结果是 _alpha=100 与 =0 落在同一毫秒,覆盖从未上屏。
+                    // 而 ProcessMessage 本来就是在这条菜单实例上被调用的,所以此刻它一定存在。
+                    SetRuntimeCoverAlpha(1.0f);
+                    logger::info("[Tier2] LoadingMenu let THROUGH and covered synchronously (iCoverTest=4)");
+                    return RE::UI_MESSAGE_RESULTS::kPassOn;
+                }
                 logger::info("[Tier2] LoadingMenu suppressed (type={}, {} ms after activation)",
                     static_cast<std::uint32_t>(msgType), NowMs() - g_suppressStarted.load());
                 return RE::UI_MESSAGE_RESULTS::kIgnore;
             }
+            if (HasPendingTransitionCompletedOnMainThread()) {
+                logger::info("[Tier2] LoadingMenu request past {} ms window ignored: transition already completed",
+                    g_suppressWindowMs.load());
+                DisarmTransitionStateOnMainThread("late menu past window after completion");
+                HideMenuIfOpen("Loading Menu");
+                return RE::UI_MESSAGE_RESULTS::kIgnore;
+            }
             logger::info("[Tier2] LoadingMenu let through: past the {} ms transition window",
-                g_config.transitionWindowMs);
-            // The vanilla menu owns the screen from here; stop drawing on it.
-            voidoverlay::Disarm("menu let through past the window");
+                g_suppressWindowMs.load());
+            // The vanilla menu owns the screen from here; stop drawing and holding frames.
+            DisarmTransitionStateOnMainThread("menu let through past the window");
         }
         return g_origLoadingProcessMessage ? g_origLoadingProcessMessage(a_this, a_msg)
                                            : RE::UI_MESSAGE_RESULTS::kPassOn;
@@ -4181,7 +5697,7 @@ namespace
         // ---- route C (v1.5.0): always cancel the ENGINE's own fade-to-black ------------------
         // The engine raises FadeToBlackImod / FadeToBlackHoldImod when a load-door transition starts
         // and holds the screen black until it fades back in after the load. Measured on this setup
-        // that is exactly the "it goes black for a moment" people report -- it survives with
+        // that is exactly the "it goes black for a moment" the user kept seeing -- it survives with
         // every effect of ours switched off. We never add black of our own; we only STOP those two
         // records, so the last frame simply stays on screen until the new cell is there.
         // NOTE: STOP them, never try to cover them -- a Hold record that is never stopped leaves a
@@ -4189,6 +5705,14 @@ namespace
         g_noBlackWanted.store(true);
         presentfreeze::TraceArm();
         presentfreeze::ArmAutoGate();
+        // v1.3.0: RE-ARM THE VISUAL LAYER.
+        // This call did not exist. When the visual route was retired in v1.5.0 the call site was
+        // deleted but the whole `voidoverlay` namespace stayed behind, still declared, still
+        // compiled, still unreachable -- so a mode set in the INI armed nothing and drew nothing,
+        // and there was no log line to say why (g_armed simply never became true, and OnPresent
+        // returns immediately in that case). A function that is never called fails silently and
+        // looks exactly like "the feature does not work on this setup".
+        voidoverlay::Arm();
         // v1.5.5: the Present hook is no longer used for drawing -- it exists solely to withhold the
         // engine's empty frames at the cut. Installed here because this is the first moment a swap
         // chain is guaranteed to exist.
@@ -4204,10 +5728,37 @@ namespace
         WorldProbeBegin();
         g_noBlackStartAt.store(NowMs());
         g_suppressFromCell.store(fromCell ? fromCell->GetFormID() : 0);
+        g_suppressDestCell.store(a_destCell);
         g_suppressStarted.store(NowMs());
-        g_suppressDeadline.store(NowMs() + static_cast<std::int64_t>(g_config.transitionWindowMs));
+        // v1.3.4: adaptive window. A heavily modded setup can need ~12 s for a rebuilt interior
+        // while a stock setup needs ~1.5 s; one fixed number cannot serve both. If we have measured this
+        // very destination cell before, give it 2x plus 3 s of headroom, clamped to 8..60 s.
+        // No history -> the configured default, untouched.
+        LoadCellTimesOnce();
+        std::uint32_t windowMs = g_config.transitionWindowMs;
+        if (!g_config.transitionWindowPinned && a_destCell != 0) {
+            std::uint32_t histMs = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_cellLoadMsMutex);
+                const auto it = g_cellLoadMs.find(a_destCell);
+                if (it != g_cellLoadMs.end()) {
+                    histMs = it->second;
+                }
+            }
+            if (histMs > 0) {
+                const std::uint32_t est = histMs * 2u + 3000u;
+                windowMs = std::clamp(est, 8000u, 60000u);
+                logger::info("[Tier2] window adapted: cell 0x{:08X} last load {} ms -> window {} ms",
+                    a_destCell, histMs, windowMs);
+            }
+        } else if (g_config.transitionWindowPinned) {
+            logger::info("[Tier2] window pinned by config: {} ms", windowMs);
+        }
+        g_suppressWindowMs.store(windowMs);
+        g_suppressDeadline.store(NowMs() + static_cast<std::int64_t>(windowMs));
         g_fallbackAt.store(0);   // only armed once we actually suppress a menu
         g_menuWasSuppressed.store(false);
+        g_deadWindowAt.store(0);   // v1.3.0: the dead window has not started yet
         g_suppressArmed.store(true);
 
         logger::info("[Timers] in effect for this transition: postLoad={} ms, queueBudget={} ms, fadeToBlack={} s, preset={}",
@@ -4218,18 +5769,20 @@ namespace
             g_suppressFromCell.load(), a_isAutoCaveDoor ? "auto/frameless" : "manual",
             g_config.suppressLoadingMenu ? "ON" : "OFF",
             g_noBlackWanted.load() ? "FREEZE" : "fade",
-            g_config.suppressTimeoutMs, a_reason);
+            windowMs, a_reason);
         // One-shot watchdog. Bounded loop, posts at most one task per step, never re-queues itself
         // (the AddTask feedback loop is what froze this project twice before).
         const std::uint32_t myGen = ++g_suppressGen;
-        std::thread([myGen]() {
+        const std::uint32_t probeMs = g_config.probeAssembly ? g_config.probeAssemblyMs : 0u;
+        const std::uint32_t totalWatchMs = windowMs + probeMs + 5000u;
+        std::thread([myGen, totalWatchMs]() {
             constexpr int kStepMs = 25;
-            constexpr int kMaxSteps = 600;  // 15 s hard cap
+            const int maxSteps = static_cast<int>((totalWatchMs + kStepMs - 1u) / kStepMs);
             bool fallbackPosted = false;
-            for (int i = 0; i < kMaxSteps; ++i) {
+            for (int i = 0; i < maxSteps; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(kStepMs));
-                if (g_suppressGen.load() != myGen) {
-                    return;   // a newer transition took over
+                if (g_shuttingDown.load(std::memory_order_acquire) || g_suppressGen.load() != myGen) {
+                    return;   // process exiting or a newer transition took over
                 }
                 if (!g_suppressArmed.load() && !g_probeArmed.load()) {
                     return;   // transition done AND assembly probe done
@@ -4237,18 +5790,58 @@ namespace
                 // Fallback re-post: measured from the moment we ACTUALLY suppressed a menu, because
                 // the engine may ask for it a full second after the activation.
                 const auto fbAt = g_fallbackAt.load();
+                // v1.3.0: the fallback has to take effect even when the main thread never services
+                // the queued task, so the state flags are flipped right here (plain atomics, safe
+                // from this thread) and the re-post is retried for a few seconds.
+                if (fbAt != 0 && NowMs() > fbAt) {
+                    // v1.3.0: the parts that MUST take effect even while the main thread is blocked
+                    // are plain atomics -- safe to flip from this thread, and the render thread reads
+                    // them immediately. The UI message itself stays on the main thread: posting it
+                    // from here would touch the message queue off-thread, which is not thread safe.
+                    g_suppressWanted.store(false);
+                    presentfreeze::g_holdActive.store(false);
+                }
                 if (!fallbackPosted && fbAt != 0 && NowMs() > fbAt) {
                     fallbackPosted = true;
                     if (auto* task = SKSE::GetTaskInterface()) {
                         task->AddTask([myGen]() {
-                            if (g_suppressGen.load() != myGen || !g_menuWasSuppressed.load()) {
+                            if (g_shuttingDown.load(std::memory_order_acquire) ||
+                                g_suppressGen.load() != myGen || !g_menuWasSuppressed.load()) {
+                                return;
+                            }
+                            // v1.3.4 CRASH-FREE FIX: look again before handing the menu back.
+                            // Measured 2026-11-08: the fallback ran at 11871 ms while the transition
+                            // had ALREADY completed (current == dest) -- it re-posted the loading menu
+                            // onto a world that was already loaded, which is the "stuck, then a loading
+                            // screen pops in" the user saw. If we have clearly moved on, do NOT re-post.
+                            if (HasPendingTransitionCompletedOnMainThread()) {
+                                auto* plFb = RE::PlayerCharacter::GetSingleton();
+                                auto* cFb = plFb ? plFb->GetParentCell() : nullptr;
+                                logger::info("[Tier2] fallback skipped: the transition already completed"
+                                             " (current 0x{:08X}, from 0x{:08X}, dest 0x{:08X}) -- not re-posting",
+                                    cFb ? cFb->GetFormID() : 0u, g_suppressFromCell.load(), g_suppressDestCell.load());
+                                g_suppressWanted.store(false);
+                                presentfreeze::g_holdActive.store(false);
                                 return;
                             }
                             // Stop suppressing from now on, otherwise the re-posted menu would be
                             // swallowed again by this same window and the player would see nothing.
                             g_suppressWanted.store(false);
+                            g_menuWasSuppressed.store(false);
                             voidoverlay::Disarm("menu re-posted (fallback)");
-                            logger::warn("[Tier2] suppressed menu did not complete in time; re-posting the LoadingMenu (fallback)");
+                            ReleaseSwapBlack();
+                            EndFreezeFrame();
+                            {
+                                const auto waited = NowMs() - g_suppressStarted.load();
+                                const auto win = g_suppressWindowMs.load();
+                                auto* pl2 = RE::PlayerCharacter::GetSingleton();
+                                auto* c2 = pl2 ? pl2->GetParentCell() : nullptr;
+                                logger::warn("[Tier2] suppressed menu did not complete in time after {} ms"
+                                             " (window {} ms); re-posting the LoadingMenu. current cell 0x{:08X},"
+                                             " from 0x{:08X}, dest 0x{:08X}",
+                                    waited, win, c2 ? c2->GetFormID() : 0u,
+                                    g_suppressFromCell.load(), g_suppressDestCell.load());
+                            }
                             if (auto* q = RE::UIMessageQueue::GetSingleton()) {
                                 q->AddMessage(RE::BSFixedString(RE::LoadingMenu::MENU_NAME.data()),
                                     RE::UI_MESSAGE_TYPE::kShow, nullptr);
@@ -4256,25 +5849,40 @@ namespace
                         });
                     }
                 }
-                if (NowMs() > g_suppressDeadline.load()) {
-                    logger::info("[Tier2] transition window elapsed without a cell change; stopping measurement");
+                if (g_suppressArmed.load() && NowMs() > g_suppressDeadline.load()) {
+                    const auto winElapsed = g_suppressWindowMs.load();
+                    logger::info("[Tier2] transition window ({} ms) elapsed without a cell change; stopping measurement", winElapsed);
                     g_suppressArmed.store(false);
+                    g_suppressWanted.store(false);
+                    presentfreeze::g_holdActive.store(false);
                     voidoverlay::Disarm("transition window elapsed without a cell change");
-                    // Never leave our black up: if the transition never reports back, release it.
+                    const bool needRepost = g_menuWasSuppressed.exchange(false) && !fallbackPosted;
+                    fallbackPosted = true;
+                    // Never leave black/freeze or a swallowed LoadingMenu up if the transition never reports back.
                     if (auto* task = SKSE::GetTaskInterface()) {
-                        task->AddTask([myGen]() {
-                            if (g_suppressGen.load() != myGen) {
+                        task->AddTask([myGen, needRepost]() {
+                            if (g_shuttingDown.load(std::memory_order_acquire) || g_suppressGen.load() != myGen) {
                                 return;
                             }
                             ReleaseSwapBlack();
                             EndFreezeFrame();
+                            if (needRepost && !HasPendingTransitionCompletedOnMainThread()) {
+                                logger::warn("[Tier2] re-posting LoadingMenu at {} ms window expiry",
+                                    g_suppressWindowMs.load());
+                                if (auto* q = RE::UIMessageQueue::GetSingleton()) {
+                                    q->AddMessage(RE::BSFixedString(RE::LoadingMenu::MENU_NAME.data()),
+                                        RE::UI_MESSAGE_TYPE::kShow, nullptr);
+                                }
+                            }
                         });
                     }
-                    return;
+                    if (!g_probeArmed.load()) {
+                        return;
+                    }
                 }
                 if (auto* task = SKSE::GetTaskInterface()) {
                     task->AddTask([myGen]() {
-                        if (g_suppressGen.load() != myGen) {
+                        if (g_shuttingDown.load(std::memory_order_acquire) || g_suppressGen.load() != myGen) {
                             return;
                         }
                         if (!g_suppressArmed.load() && !g_probeArmed.load()) {
@@ -4296,10 +5904,12 @@ namespace
                             // Only cancel the records that DARKEN the screen. Cancelling the fade-BACK
                             // as well makes the engine's own fade-in restart every 25 ms, which reads
                             // as strobing (the "scene spins into place" effect) right at the swap.
-                            if (g_fadeImod) {
+                            // v1.12.0 cover test: when it is on we WANT the darkening record alive --
+                            // it is the fullscreen cover we are trying to prove out.
+                            if (g_fadeImod && g_config.coverTest == 0) {
                                 RE::ImageSpaceModifierInstanceForm::Stop(g_fadeImod);
                             }
-                            if (g_fadeHoldImod) {
+                            if (g_fadeHoldImod && g_config.coverTest == 0) {
                                 RE::ImageSpaceModifierInstanceForm::Stop(g_fadeHoldImod);
                             }
                         }
@@ -4308,14 +5918,43 @@ namespace
                             VoidRampStep();
                         }
                         WorldProbeStep();
+                        if (g_config.coverTest == 4 && g_coverUiWanted.load()) {
+                            // 只维持满覆盖。渐隐若由 tick 驱动会被饿死(实测 2081/12028 ms),
+                            // 所以过渡只能交给 Scaleform 自己推进(见 onEnterFrame 计划)。
+                            SetRuntimeCoverAlpha(1.0f);
+                        }
                         auto* pl = RE::PlayerCharacter::GetSingleton();
                         if (!pl) {
                             return;
                         }
                         auto* cell = pl->GetParentCell();
-                        if (cell && cell->GetFormID() != g_suppressFromCell.load()) {
+                        // v1.3.4: two independent acceptance signals, and one diagnostic line per
+                        // second while we wait -- so a future report shows which id disagreed.
+                        const auto curID = cell ? cell->GetFormID() : 0u;
+                        const auto fromID = g_suppressFromCell.load();
+                        const auto destID = g_suppressDestCell.load();
+                        const bool movedByFrom = cell && curID != fromID;
+                        const bool movedByDest = cell && destID != 0 && destID != fromID && curID == destID;
+                        {
+                            static std::int64_t lastDiag = 0;
+                            if (NowMs() - lastDiag > 1000) {
+                                lastDiag = NowMs();
+                                logger::info("[Tier2] waiting: current 0x{:08X}, from 0x{:08X}, dest 0x{:08X}",
+                                    curID, fromID, destID);
+                            }
+                        }
+                        if (movedByFrom || movedByDest) {
                             const auto ms = NowMs() - g_suppressStarted.load();
-                            g_cellLoadMs[cell->GetFormID()] = static_cast<std::uint32_t>(ms);
+                            if (ms > 0) {
+                                // v1.3.4d: keep the WORST (cold) time, not the last one. A hot-cache
+                                // re-entry is much faster and would shrink the window for the next cold
+                                // load -- measured 11578 ms cold vs 5014 ms hot on the same door.
+                                std::lock_guard<std::mutex> lk(g_cellLoadMsMutex);
+                                auto& slot = g_cellLoadMs[cell->GetFormID()];
+                                const auto v = static_cast<std::uint32_t>(ms);
+                                slot = (v > slot) ? v : slot;
+                            }
+                            ScheduleCellTimesSave();
                             const bool wasSuppressed = g_menuWasSuppressed.exchange(false);
                             g_suppressArmed.store(false);
                             logger::info("[Tier2] real transition finished in {} ms (cell 0x{:08X} -> 0x{:08X}, menu {})",
@@ -4323,10 +5962,33 @@ namespace
                                 wasSuppressed ? "suppressed" : "shown");
                             // v1.4.0: this is the cut -- the new cell is current and the engine's
                             // ~350 ms scene spin starts here. Hand the overlay over to its pulse.
+                            // v1.3.0: this call was missing too (same v1.5.0 removal). Without it
+                            // g_cut never becomes true, so the dead-window push-in would run to its
+                            // cap and then sit on a frozen zoomed frame until the hard cap disarmed
+                            // the layer -- i.e. no cross-fade, and the picture stuck at max push-in.
+                            voidoverlay::Cut();
                             LogOpenMenus("cut");
                             g_graceSuppressUntil.store(NowMs() + 2500);
+                            g_graceEaten.store(0);
                             HideMenuIfOpen("Loading Menu");   // safety net: never leave it up
                             StopEngineBlack("at cut (fade-back raises black again)");
+                            if (g_config.coverTest == 4) {
+                                // v1.16.1: 渐隐改回"立即撤"。
+                                // 实测(日志):周期任务驱动一次 500 ms 的渐隐,实际用了 2081 ms 和 12028 ms
+                                // —— 覆盖压在新 cell 上近 2~12 秒,比原问题更糟。加载/切场期间我们的
+                                // 周期任务跑不动,所以任何"由 C++ tick 驱动的动画"在这条路上都不成立。
+                                g_coverUiWanted.store(false);
+                                SetRuntimeCoverAlpha(0.0f);
+                                logger::info("[CoverTest] cover removed immediately at the cut");
+                            } else if (g_config.coverTest == 3) {
+                                SetRuntimeCoverAlpha(0.0f);
+                                logger::info("[CoverTest] cover down at the cut: UI runtime clip (alpha 0)");
+                            } else if (g_config.coverTest == 2) {
+                                SetCoverAlpha(0.0f);
+                                logger::info("[CoverTest] cover down at the cut: UI layer (alpha 0)");
+                            } else if (g_config.coverTest == 1) {
+                                logger::info("[CoverTest] cover down at the cut -- watch whether the hand-back is clean");
+                            }
                             presentfreeze::HoldAtCut(g_config.holdAtCutMs);
                             presentfreeze::ArmHitchWindow();
                             // v1.4.12: the counter used to be bumped only on the frozen pocket path, so the
@@ -4367,7 +6029,7 @@ namespace
                                 // v1.5.2: route C adds NO mask here. The old "cut mask" was a black
                                 // image-space drip (sCutMaskImod) triggered right at the cut; with route
                                 // C always on it fired on every single transition -- and THAT was the
-                                // "black flash" people report, surviving every visual switch
+                                // "black flash" the user kept reporting, surviving every visual switch
                                 // because it is part of the core path, not the visual layer.
                             } else if (g_config.visualEnvelope && g_config.envelopeBlackHoldMs > 0) {
                                 HoldBlackThenFadeIn(g_config.envelopeBlackHoldMs);
@@ -4386,6 +6048,26 @@ namespace
                     });
                 }
             }
+            if (g_shuttingDown.load(std::memory_order_acquire) || g_suppressGen.load() != myGen) {
+                return;
+            }
+            const bool hadSuppress = g_suppressArmed.exchange(false);
+            const bool hadProbe = g_probeArmed.exchange(false);
+            if (hadSuppress || hadProbe) {
+                g_suppressWanted.store(false);
+                presentfreeze::g_holdActive.store(false);
+                g_menuWasSuppressed.store(false);
+                voidoverlay::Disarm("watchdog step cap reached");
+                if (auto* task = SKSE::GetTaskInterface()) {
+                    task->AddTask([myGen]() {
+                        if (g_shuttingDown.load(std::memory_order_acquire) || g_suppressGen.load() != myGen) {
+                            return;
+                        }
+                        ReleaseSwapBlack();
+                        EndFreezeFrame();
+                    });
+                }
+            }
         }).detach();
     }
 
@@ -4401,13 +6083,26 @@ namespace
             return;
         }
         std::uint32_t oldProt = 0;
+        // v1.2.2: report WHO owned the slot before us. Anything that hooks the loading menu
+        // (the same class of mod as Faster Loadscreens / Loading Screen Truce / custom loading
+        // screens) sits on this exact vtable entry, and while we suppress a request our handler
+        // returns without calling theirs -- their feature is silently bypassed for that request.
+        // The log line is the fastest way for a user to tell us what is chained here.
+        const auto prevOwner = capprobe::ModuleOf(table[kProcessMessageIdx]);
+        const auto prevAddr = reinterpret_cast<std::uintptr_t>(table[kProcessMessageIdx]);
         if (REX::W32::VirtualProtect(&table[kProcessMessageIdx], sizeof(void*), kPageExecuteReadWrite, &oldProt)) {
             g_origLoadingProcessMessage = reinterpret_cast<ProcessMessage_t>(table[kProcessMessageIdx]);
             table[kProcessMessageIdx] = reinterpret_cast<void*>(&HookedLoadingMenuProcessMessage);
             REX::W32::VirtualProtect(&table[kProcessMessageIdx], sizeof(void*), oldProt, &oldProt);
-            logger::info("[Tier2] LoadingMenu ProcessMessage hook installed at vtable[0x04]=0x{:X} (suppression {})",
-                reinterpret_cast<std::uintptr_t>(g_origLoadingProcessMessage),
-                g_config.suppressLoadingMenu ? "ENABLED" : "disabled");
+            logger::info("[Tier2] LoadingMenu ProcessMessage hook installed at vtable[0x04]=0x{:X} in {} (suppression {})",
+                prevAddr, prevOwner, g_config.suppressLoadingMenu ? "ENABLED" : "disabled");
+            const bool foreign = (prevOwner != "SkyrimSE.exe" && prevOwner != "?");
+            if (foreign) {
+                logger::warn("[Compat] the loading-menu vtable was already hooked by {} -- while a door "
+                             "transition is suppressed, that mod's handler is not called. If loading screens, "
+                             "loading-related UI or its own transitions misbehave, set bSuppressLoadingMenu=0 "
+                             "and report this line.", prevOwner);
+            }
         } else {
             logger::warn("[Tier2] could not make the LoadingMenu vtable writable");
         }
@@ -4841,10 +6536,18 @@ namespace
         // Adaptive fallback: a cell we have already measured as slow gets the vanilla loading menu
         // instead of a long black gap. 0 disables the check.
         if (g_config.suppressMaxMs > 0) {
-            const auto msIt = g_cellLoadMs.find(destCellID);
-            if (msIt != g_cellLoadMs.end() && msIt->second > g_config.suppressMaxMs) {
+            LoadCellTimesOnce();
+            std::uint32_t lastMs = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_cellLoadMsMutex);
+                const auto msIt = g_cellLoadMs.find(destCellID);
+                if (msIt != g_cellLoadMs.end()) {
+                    lastMs = msIt->second;
+                }
+            }
+            if (lastMs > g_config.suppressMaxMs) {
                 logger::info("[Tier2] cell 0x{:08X} last load measured {} ms (> uSuppressMaxMs {}); showing the vanilla menu",
-                    destCellID, msIt->second, g_config.suppressMaxMs);
+                    destCellID, lastMs, g_config.suppressMaxMs);
                 return g_origDoorActivate(a_this, effectiveDoor, a_activatorRef, a_arg3, a_object, a_targetCount);
             }
         }
@@ -4859,7 +6562,7 @@ namespace
 
         const bool isFromInterior = isClonedPocketDoor || playerHostCell->IsInteriorCell();
         if (isFromInterior && !g_config.allowInteriorToInterior) {
-            ArmLoadingMenuSuppression("interior->interior disabled", IsAutoOrFramelessDoor(a_targetRef));
+            ArmLoadingMenuSuppression("interior->interior disabled", IsAutoOrFramelessDoor(a_targetRef), destCellID);
             return g_origDoorActivate(a_this, effectiveDoor, a_activatorRef, a_arg3, a_object, a_targetCount);
         }
 
@@ -4911,7 +6614,7 @@ namespace
         }
 
         if (!pocketReady) {
-            ArmLoadingMenuSuppression("pocket unavailable (quota / oversized cell)", IsAutoOrFramelessDoor(a_targetRef));
+            ArmLoadingMenuSuppression("pocket unavailable (quota / oversized cell)", IsAutoOrFramelessDoor(a_targetRef), destCellID);
             return g_origDoorActivate(a_this, effectiveDoor, a_activatorRef, a_arg3, a_object, a_targetCount);
         }
 
@@ -4978,7 +6681,12 @@ namespace
         {
             REL::Relocation<std::uintptr_t> doorVtbl{ RE::VTABLE_TESObjectDOOR[0] };
             auto** vtbl = reinterpret_cast<void**>(doorVtbl.address());
-            if (vtbl && IsExecutableAddress(vtbl[kActivateIdx])) {
+            // v1.10.2: without this guard a second install captures OUR function as the original, and
+            // HookedDoorActivate then calls itself -- stack overflow, instant CTD. kDataLoaded only
+            // fires once today, but the guard costs nothing and removes a whole failure class.
+            if (g_origDoorActivate != nullptr) {
+                logger::warn("TESObjectDOOR::Activate hook already installed; skipping the second install");
+            } else if (vtbl && IsExecutableAddress(vtbl[kActivateIdx])) {
                 std::uint32_t oldProt = 0;
                 if (REX::W32::VirtualProtect(&vtbl[kActivateIdx], sizeof(void*), kPageExecuteReadWrite, &oldProt)) {
                     g_origDoorActivate = reinterpret_cast<Activate_t>(vtbl[kActivateIdx]);
@@ -5024,16 +6732,38 @@ namespace
 
     void ApplyEngineTimerTweaks();   // defined below; the menu can re-apply without a restart
 
+    // v1.10.2: a slider fires on every mouse-move while dragging, and SaveConfig rewrites the whole
+    // INI (tmp + rename). At 60 Hz that is 60 file writes per second on the game's main thread --
+    // a visible stutter in the menu. Coalesce instead: mark "save soon" on every change, and flush
+    // once the dragging has been quiet for a moment (checked from the menu's own draw call).
+    std::atomic<std::int64_t> g_savePendingAt{ 0 };
+
+    void SaveConfigSoon()
+    {
+        g_savePendingAt.store(NowMs() + 300, std::memory_order_relaxed);
+    }
+
+    void FlushPendingSave()
+    {
+        const auto at = g_savePendingAt.load(std::memory_order_relaxed);
+        if (at == 0 || NowMs() < at) {
+            return;
+        }
+        g_savePendingAt.store(0, std::memory_order_relaxed);
+        SaveConfig();
+        SaveCellTimes();
+    }
+
     void __stdcall RenderMainMenu()
     {
         bool en = g_config.enabled;
         if (ImGuiMCP::Checkbox(L("menu.enable", "Enable LoadingFlow faster door loading"), &en)) {
             g_config.enabled = en;
-            SaveConfig();
+            SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
         }
         ImGuiMCP::SameLine();
         if (ImGuiMCP::Button(L("menu.btn.save", "Save Config"))) {
-            SaveConfig();
+            SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
         }
         ImGuiMCP::SameLine();
         if (ImGuiMCP::Button(L("menu.btn.reload", "Reload INI"))) {
@@ -5078,16 +6808,31 @@ namespace
         ImGuiMCP::Separator();
         ImGuiMCP::Text(L("menu.sec.transitions", "-- Transitions --"));
         if (ImGuiMCP::Checkbox(L("menu.suppressLoadingMenu", "Tier2: hide the Loading Menu during real cell transitions (auto fallback)"), &g_config.suppressLoadingMenu)) {
-            SaveConfig();
+            SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
+        }
+        if (g_config.suppressLoadingMenu) {
+            // v1.3.0: the risk is now stated where the switch is, not only in the INI.
+            ImGuiMCP::TextColored(ImGuiMCP::ImVec4(1.0f, 0.72f, 0.35f, 1.0f),
+                L("menu.suppressRisk",
+                    "Risk: while the menu is hidden, a cell change that fails or takes very long can leave the HUD off and player controls disabled. Turn this off if you get stuck after a door."));
+        }
+        {
+            int fallbackMs = static_cast<int>(g_config.suppressTimeoutMs);
+            if (ImGuiMCP::SliderInt(L("menu.fallbackTimeout",
+                    "Give the Loading Menu back if a transition takes longer than this (ms)"),
+                    &fallbackMs, 0, 60000, "%d ms")) {
+                g_config.suppressTimeoutMs = static_cast<std::uint32_t>(fallbackMs);
+                SaveConfigSoon();
+            }
         }
         if (ImGuiMCP::Checkbox(L("menu.prewarmNearbyDoors", "Tier3: pre-warm models of nearby interiors while walking"), &g_config.prewarmNearbyDoors)) {
-            SaveConfig();
+            SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
         }
         if (ImGuiMCP::Checkbox(L("menu.sneakVanilla", "Hold Sneak while activating a door to force the vanilla load screen"), &g_config.sneakForcesVanillaLoad)) {
-            SaveConfig();
+            SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
         }
         if (ImGuiMCP::Checkbox(L("menu.debugNotify", "Show a top-left HUD notification on every transition (debug)"), &g_config.showDebugNotifications)) {
-            SaveConfig();
+            SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
         }
 
         ImGuiMCP::Separator();
@@ -5104,7 +6849,7 @@ namespace
                 g_config.postLoadUpdateTimeMS = a_postLoad;
                 g_config.loadingQueuedPriorityBudgetMs = a_queueBudget;
                 g_config.fadeToBlackFadeSeconds = a_fade;
-                SaveConfig();
+                SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
                 ApplyEngineTimerTweaks();
                 logger::info("[Timers] preset '{}' applied: postLoad={} ms, queueBudget={} ms, fade={} s",
                     a_name, a_postLoad, a_queueBudget, a_fade);
@@ -5114,7 +6859,7 @@ namespace
                 g_config.postLoadUpdateTimeMS = g_origPostLoad.load();
                 g_config.loadingQueuedPriorityBudgetMs = g_origQueueBudget.load();
                 g_config.fadeToBlackFadeSeconds = 1.0f;   // vanilla fade-to-black, 1 s
-                SaveConfig();
+                SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
                 ApplyEngineTimerTweaks();
                 logger::info("[Timers] preset 'stable' restored engine originals");
             }
@@ -5133,12 +6878,12 @@ namespace
             int postLoad = static_cast<int>(g_config.postLoadUpdateTimeMS);
             if (ImGuiMCP::SliderInt(L("menu.timers.postLoad", "Post-load script wait (ms, vanilla 2000, lower = faster but riskier)"), &postLoad, -1, 2000, "%d ms")) {
                 g_config.postLoadUpdateTimeMS = static_cast<float>(postLoad);
-                SaveConfig();
+                SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
             }
             int queueBudget = g_config.loadingQueuedPriorityBudgetMs;
             if (ImGuiMCP::SliderInt(L("menu.timers.queue", "Background streaming budget (ms, vanilla 20)"), &queueBudget, -1, 1000, "%d ms")) {
                 g_config.loadingQueuedPriorityBudgetMs = queueBudget;
-                SaveConfig();
+                SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
             }
             if (ImGuiMCP::Button(L("menu.timers.apply", "Apply engine timers now"))) {
                 ApplyEngineTimerTweaks();
@@ -5147,8 +6892,91 @@ namespace
             ImGuiMCP::Text(L("menu.timers.note", "Lower waits = faster doors, but scripts and mods get less time."));
         }
 
+        FlushPendingSave();
+
+        ImGuiMCP::Separator();
+        ImGuiMCP::Text(L("menu.sec.visual", "-- Door transition look --"));
+        {
+            int crossFade = static_cast<int>(g_config.crossFadeMs);
+            if (ImGuiMCP::SliderInt(L("menu.visual.crossFade", "Dissolve into the new cell (ms) -- the length of the dissolve itself"), &crossFade, 0, 800, "%d ms")) {
+                g_config.crossFadeMs = static_cast<std::uint32_t>(std::clamp(crossFade, 0, 800));
+                SaveConfigSoon();
+            }
+            int holdMs = static_cast<int>(g_config.crossFadeHoldMs);
+            if (ImGuiMCP::SliderInt(L("menu.visual.hold", "Hold the old picture at the cut (ms) -- covers the engine's rotation"), &holdMs, 0, 6000, "%d ms")) {
+                g_config.crossFadeHoldMs = static_cast<std::uint32_t>(std::clamp(holdMs, 0, 6000));
+                SaveConfigSoon();
+            }
+            int blurPx = static_cast<int>(lroundf(g_config.deadBlurPx));
+            if (ImGuiMCP::SliderInt(L("menu.visual.blur", "Frosted-glass blur of the frozen picture (pixels, 0 = off)"), &blurPx, 0, 120, "%d px")) {
+                g_config.deadBlurPx = static_cast<float>(blurPx);
+                SaveConfigSoon();
+            }
+            int rampMs = static_cast<int>(g_config.deadZoomMs);
+            if (ImGuiMCP::SliderInt(L("menu.visual.ramp", "How long the blur takes to build up (ms)"), &rampMs, 200, 4000, "%d ms")) {
+                g_config.deadZoomMs = static_cast<std::uint32_t>(std::clamp(rampMs, 200, 4000));
+                SaveConfigSoon();
+            }
+            int pushIn = static_cast<int>(lroundf(g_config.deadZoomAmount * 100.0f));
+            if (ImGuiMCP::SliderInt(L("menu.visual.pushIn", "Push-in instead of blur (percent, 0 = off)"), &pushIn, 0, 15, "%d %%")) {
+                g_config.deadZoomAmount = static_cast<float>(pushIn) / 100.0f;
+                SaveConfigSoon();
+            }
+            ImGuiMCP::Text(L("menu.visual.note", "Applies from the next door. No restart needed."));
+        }
+
+        ImGuiMCP::Separator();
+        ImGuiMCP::Text(L("menu.sec.noBlack", "-- Frozen picture (no-black) --"));
+        if (ImGuiMCP::Checkbox(L("menu.noBlack", "Keep the last picture on screen instead of the engine's fade to black"), &g_config.noBlackTransition)) {
+            // v1.3.2: this used to only write the INI. A hold that was already armed stayed armed,
+            // so unticking the box could leave the screen frozen with nothing on the UI to undo it.
+            if (!g_config.noBlackTransition) {
+                presentfreeze::g_holdActive.store(false);
+            }
+            SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
+        }
+        if (g_config.noBlackTransition) {
+            ImGuiMCP::TextColored(ImGuiMCP::ImVec4(1.0f, 0.72f, 0.35f, 1.0f),
+                L("menu.noBlackRisk",
+                    "Off by default since 1.3.0: this is what makes a slow load look like a freeze. It is also the setting that hid a transition softlock."));
+        }
+        if (ImGuiMCP::Checkbox(L("menu.noBlackManual", "  ... for manual doors"), &g_config.noBlackOnlyForManualDoors)) {
+            if (!g_config.noBlackOnlyForManualDoors) {
+                presentfreeze::g_holdActive.store(false);
+            }
+            SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
+        }
+        if (ImGuiMCP::Checkbox(L("menu.noBlackWalk", "  ... for walk-through doors"), &g_config.noBlackForWalkThrough)) {
+            if (!g_config.noBlackForWalkThrough) {
+                presentfreeze::g_holdActive.store(false);
+            }
+            SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
+        }
+        {
+            int holdCut = static_cast<int>(g_config.holdAtCutMs);
+            if (ImGuiMCP::SliderInt(L("menu.holdAtCut",
+                    "Freeze the last frame after the cut (ms, 0 = do not freeze at all)"),
+                    &holdCut, 0, 600, "%d ms")) {
+                g_config.holdAtCutMs = static_cast<std::uint32_t>(holdCut);
+                if (holdCut == 0) {
+                    // apply immediately: an already-armed hold must not keep the screen frozen
+                    presentfreeze::g_holdActive.store(false);
+                }
+                SaveConfigSoon();
+            }
+        }
+        {
+            int fadeCs = static_cast<int>(g_config.fadeToBlackFadeSeconds * 100.0f + 0.5f);
+            if (ImGuiMCP::SliderInt(L("menu.timers.fadeToBlack",
+                    "Engine fade to/from black (1/100 s; 10 = the old 0.10 s snap, 40 = smooth)"),
+                    &fadeCs, 5, 100, "%d / 100 s")) {
+                g_config.fadeToBlackFadeSeconds = static_cast<float>(fadeCs) / 100.0f;
+                SaveConfigSoon();
+            }
+        }
+
         if (ImGuiMCP::Checkbox(L("menu.globalSuppress", "Global: suppress the menu for non-door transitions too"), &g_config.globalMenuSuppression)) {
-            SaveConfig();
+            SaveConfigSoon();   // v1.3.2: never write the INI synchronously from a UI callback
         }
     }
 
@@ -5161,6 +6989,22 @@ namespace
         SKSEMenuFramework::SetSection("LoadingFlow");
         SKSEMenuFramework::AddSectionItem("LoadingFlow", RenderMainMenu);
         logger::info("Registered SKSEMenuFramework section: LoadingFlow");
+        // ---- v1.3.5 persistent-state audit -----------------------------------------------------
+        // Written because the question "did the last few versions bake some setting into the game?"
+        // is answerable, and guessing at it wastes days. Everything this plugin does to the game is
+        // one of two things:
+        //   1. an in-memory write to a GameSetting (never written back to any INI), or
+        //   2. a vtable-slot pointer swap (also process memory).
+        // Neither survives the process. The only file we ever create or modify is our own INI.
+        // The timestamps are printed by whoever wants them with `ls -la` outside the game; this log
+        // states what to compare, so a future reader does not have to re-derive it.
+        logger::info("[Audit] files this plugin writes: Data/SKSE/Plugins/LoadingFlow.ini, LoadingFlow_CellTimes.ini, LoadingFlow_Blueprints.bin");
+        logger::info("[Audit] game INIs: never written -- engine settings are patched in memory only");
+        logger::info("[Audit] vtable patches are process-local; exiting the game restores the originals");
+        logger::info("[Audit] no registry keys, no save-game data, no Papyrus scripts, no BSA/ESP edits");
+        logger::info("[Audit] visual mode {} / present1 bypass {} / submit route {} / present audit {} -- with mode 0 the Present hook draws nothing",
+            g_config.visualMode, g_config.usePresent1ForVisual ? 1 : 0, g_config.submitRoute,
+            g_config.presentAudit ? 1 : 0);
     }
 #else
     void RegisterMenu() {}
@@ -5327,6 +7171,567 @@ namespace
             g_config.postLoadUpdateTimeMS, g_config.loadingQueuedPriorityBudgetMs, g_config.fadeToBlackFadeSeconds);
     }
 
+    // ============================ v1.13.0 UI-layer cover ============================
+    // Why this exists: drawing at Present time (our earlier visual layer) reroutes the frames that
+    // carry our pixels through slot 22. That starves the upscaler / frame-generation chain, and the
+    // frame handed back afterwards is broken (a 16:9 quadrant of un-upscaled world buffer). A cover
+    // that lives in the UI layer is composited by the engine AFTER upscaling, so it never touches the
+    // present sequence at all.
+    //
+    // Mechanics:
+    //   * Data/Interface/LoadingFlowCover.swf  -- one fullscreen quad, instance name "cover"
+    //   * this IMenu subclass                  -- hosts the movie; the engine advances/displays it
+    //   * SetVariable("cover._alpha", 0..100)  -- the on/off switch, a plain dotted path
+    // ---- v1.13.2 runtime AS2 cover (iCoverTest = 3) --------------------------------
+    // Why this exists: our hand-built 90-byte SWF is accepted by FFDec but the ENGINE's Scaleform
+    // refused to load it (menu instantiated, uiMovie stayed null). Drawing at runtime into a movie
+    // the engine already loaded sidesteps SWF authoring completely:
+    //   createEmptyMovieClip -> beginFill -> moveTo/lineTo x4 -> endFill, then drive _alpha.
+    // Host menu: Fader Menu first -- it is kAlwaysOpen and the engine keeps drawing it during a
+    // transition (that is exactly what it is for). HUD Menu is the fallback.
+    // ---- v1.13.4 runtime AS2 cover, audited -----------------------------------------
+    // v1.13.3 findings fixed here:
+    //   1. every drawing Invoke() return value was discarded -> a failed beginFill/lineTo left an
+    //      EMPTY clip that still accepted _alpha=100. That is indistinguishable from "painted but
+    //      not rendered". All steps are now checked and logged.
+    //   2. we drew in absolute stage coordinates without setting the clip's own _x/_y -> if the host
+    //      movie's origin is not (0,0) the rectangle lands off-screen. Now: draw local (0,0)-(w,h)
+    //      and position the clip explicitly.
+    //   3. clips were dropped at alpha 0 and rebuilt next door. Now kept and reused.
+    //   4. no read-back after setting _alpha -> could not tell "not set" from "set but not drawn".
+    //      Now reads the property back and logs it.
+    struct CoverClip
+    {
+        RE::GFxValue clip;
+        RE::GFxMovieView* movie = nullptr;
+        const char*  host = "";
+    };
+    std::vector<CoverClip> g_coverClips;
+
+    // v1.16.0: 把"最后一帧"压成 kCoverW x kCoverH 的色块网格。
+    // 手段:整帧 CopyResource 到一块同格式的 staging,再在 CPU 上按网格做盒式平均。
+    // 缩小本身就是模糊 —— 之后 Scaleform 端再用双线性插值放大,得到磨玻璃观感。
+    bool SampleLastFrameGrid()
+    {
+        auto* sc = static_cast<IDXGISwapChain*>(g_lastSwapChain.load());
+        if (!sc) {
+            logger::info("[CoverTex] no swapchain recorded yet");
+            return false;
+        }
+        using namespace RE::BSGraphics;
+        auto* rd = Renderer::GetRendererData();
+        auto* device = rd ? reinterpret_cast<ID3D11Device*>(rd->forwarder) : nullptr;
+        auto* ctx = rd ? reinterpret_cast<ID3D11DeviceContext*>(rd->context) : nullptr;
+        if (!device || !ctx) {
+            return false;
+        }
+        const std::uint32_t idx = presentfreeze::CurrentBackBufferIndex(sc);
+        ID3D11Texture2D* back = nullptr;
+        if (FAILED(sc->GetBuffer(idx, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back))) || !back) {
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC desc{};
+        back->GetDesc(&desc);
+
+        static ID3D11Texture2D* s_staging = nullptr;
+        static std::uint32_t s_w = 0, s_h = 0, s_fmt = 0;
+        if (!s_staging || s_w != desc.Width || s_h != desc.Height || s_fmt != static_cast<std::uint32_t>(desc.Format)) {
+            if (s_staging) {
+                s_staging->Release();
+                s_staging = nullptr;
+            }
+            D3D11_TEXTURE2D_DESC sd = desc;
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.BindFlags = 0;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            sd.MiscFlags = 0;
+            sd.MipLevels = 1;
+            sd.ArraySize = 1;
+            if (FAILED(device->CreateTexture2D(&sd, nullptr, &s_staging)) || !s_staging) {
+                back->Release();
+                logger::info("[CoverTex] staging creation failed");
+                return false;
+            }
+            s_w = desc.Width;
+            s_h = desc.Height;
+            s_fmt = static_cast<std::uint32_t>(desc.Format);
+        }
+        ctx->CopyResource(s_staging, back);
+        back->Release();
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(ctx->Map(s_staging, 0, D3D11_MAP_READ, 0, &mapped)) || !mapped.pData) {
+            logger::info("[CoverTex] map failed");
+            return false;
+        }
+        const auto* base = static_cast<const std::uint8_t*>(mapped.pData);
+        const bool tenBit = (desc.Format == 24);
+        for (int gy = 0; gy < kCoverH; ++gy) {
+            const std::uint32_t y0 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(gy) * s_h / kCoverH);
+            const std::uint32_t y1 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(gy + 1) * s_h / kCoverH);
+            for (int gx = 0; gx < kCoverW; ++gx) {
+                const std::uint32_t x0 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(gx) * s_w / kCoverW);
+                const std::uint32_t x1 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(gx + 1) * s_w / kCoverW);
+                std::uint64_t r = 0, g = 0, b = 0, n = 0;
+                // 每格取 4x4 个采样点求平均,够稳且便宜
+                for (int sy = 0; sy < 4; ++sy) {
+                    const std::uint32_t py = y0 + (y1 > y0 ? (y1 - y0) * sy / 4 : 0);
+                    if (py >= s_h) continue;
+                    const auto* row = base + static_cast<std::size_t>(py) * mapped.RowPitch;
+                    for (int sx = 0; sx < 4; ++sx) {
+                        const std::uint32_t px = x0 + (x1 > x0 ? (x1 - x0) * sx / 4 : 0);
+                        if (px >= s_w) continue;
+                        if (tenBit) {
+                            std::uint32_t v = 0;
+                            std::memcpy(&v, row + static_cast<std::size_t>(px) * 4, 4);
+                            r += (v >> 20) & 0x3FF;
+                            g += (v >> 10) & 0x3FF;
+                            b += v & 0x3FF;
+                        } else {
+                            r += row[static_cast<std::size_t>(px) * 4 + 0];
+                            g += row[static_cast<std::size_t>(px) * 4 + 1];
+                            b += row[static_cast<std::size_t>(px) * 4 + 2];
+                        }
+                        ++n;
+                    }
+                }
+                if (n == 0) n = 1;
+                std::uint32_t rr, gg, bb;
+                if (tenBit) {
+                    rr = static_cast<std::uint32_t>(r / n * 255 / 1023);
+                    gg = static_cast<std::uint32_t>(g / n * 255 / 1023);
+                    bb = static_cast<std::uint32_t>(b / n * 255 / 1023);
+                } else {
+                    rr = static_cast<std::uint32_t>(r / n);
+                    gg = static_cast<std::uint32_t>(g / n);
+                    bb = static_cast<std::uint32_t>(b / n);
+                }
+                g_coverPx[gy * kCoverW + gx] = (rr << 16) | (gg << 8) | bb;
+            }
+        }
+        ctx->Unmap(s_staging, 0);
+        g_coverPxValid = true;
+        logger::info("[CoverTex] sampled {}x{} grid from {}x{} fmt={}", kCoverW, kCoverH, s_w, s_h,
+            static_cast<int>(desc.Format));
+        return true;
+    }
+
+    bool PaintCoverInto(RE::IMenu* a_menu, const char* a_name)
+    {
+        if (!a_menu || !a_menu->uiMovie) {
+            logger::info("[CoverUi] host '{}': no movie", a_name);
+            return false;
+        }
+        if (a_menu->CustomRendering()) {
+            logger::info("[CoverUi] host '{}': SKIPPED (kCustomRendering -- engine never draws its movie)",
+                a_name);
+            return false;
+        }
+        auto* movie = a_menu->uiMovie.get();
+        const auto rect = movie->GetVisibleFrameRect();
+        double ox = rect.left;
+        double oy = rect.top;
+        double w  = rect.right - rect.left;
+        double h  = rect.bottom - rect.top;
+        if (!(w > 0.0) || !(h > 0.0)) { ox = 0.0; oy = 0.0; w = 1920.0; h = 1080.0; }
+        if (w < 1280.0 || h < 720.0) { ox = -512.0; oy = -512.0; w = 2560.0; h = 2560.0; }
+
+        RE::GFxValue nameArg;
+        movie->CreateString(&nameArg, "lfCover");
+        RE::GFxValue depthArg;
+        depthArg.SetNumber(987654.0);
+        auto createArgs = std::array{ nameArg, depthArg };
+        RE::GFxValue clip;
+        const bool created = movie->Invoke("createEmptyMovieClip", &clip, createArgs.data(), 2);
+        if (!created || !clip.IsDisplayObject()) {
+            logger::info("[CoverUi] host '{}': createEmptyMovieClip failed (created={} displayObj={})",
+                a_name, created ? "true" : "false", clip.IsDisplayObject() ? "true" : "false");
+            return false;
+        }
+
+        // 画在 clip 的本地空间 (0,0)-(w,h)，再把 clip 摆到 rect 原点 —— 不依赖宿主的坐标原点。
+        // v1.14.1: 用洋红而不是黑色。教训:加载界面的背景本来就是大片黑,用黑去盖它
+        // 无论生效与否肉眼都分辨不出 —— 前几轮"没生效"的判读因此完全不可信。
+        // 洋红只在这一步当"探针色"用,证明通路;下一步立即换成磨玻璃纹理。
+        // ---- v1.16.0 frosted cover: BitmapData + smooth upscale first, mosaic as fallback ----
+        const bool havePixels = SampleLastFrameGrid();
+        bool bFill = false;
+        const char* style = "solid";
+
+        auto drawQuad = [&](double qx0, double qy0, double qx1, double qy1) {
+            auto mv = std::array{ RE::GFxValue(), RE::GFxValue() };
+            mv[0].SetNumber(qx0); mv[1].SetNumber(qy0);
+            clip.Invoke("moveTo", nullptr, mv.data(), 2);
+            const double q[3][2] = { { qx1, qy0 }, { qx1, qy1 }, { qx0, qy1 } };
+            for (const auto& pt : q) {
+                auto ln = std::array{ RE::GFxValue(), RE::GFxValue() };
+                ln[0].SetNumber(pt[0]); ln[1].SetNumber(pt[1]);
+                clip.Invoke("lineTo", nullptr, ln.data(), 2);
+            }
+            clip.Invoke("endFill", nullptr);
+        };
+
+        if (havePixels) {
+            RE::GFxValue bwv; bwv.SetNumber(static_cast<double>(kCoverW));
+            RE::GFxValue bhv; bhv.SetNumber(static_cast<double>(kCoverH));
+            auto bdArgs = std::array{ bwv, bhv };
+            RE::GFxValue bd;
+            movie->CreateObject(&bd, "flash.display.BitmapData", bdArgs.data(), 2);
+            const bool bdObj = bd.IsObject();
+            logger::info("[CoverTex] CreateObject BitmapData -> IsObject={} type={}",
+                bdObj ? "true" : "false", static_cast<int>(bd.GetType()));
+            bool ok = bdObj;
+            int pixDone = 0;
+            if (ok) {
+                for (int gy = 0; gy < kCoverH && ok; ++gy) {
+                    for (int gx = 0; gx < kCoverW; ++gx) {
+                        auto px = std::array{ RE::GFxValue(), RE::GFxValue(), RE::GFxValue() };
+                        px[0].SetNumber(static_cast<double>(gx));
+                        px[1].SetNumber(static_cast<double>(gy));
+                        px[2].SetNumber(static_cast<double>(g_coverPx[gy * kCoverW + gx]));
+                        if (!bd.Invoke("setPixel", nullptr, px.data(), 3)) { ok = false; break; }
+                        ++pixDone;
+                    }
+                }
+            }
+            logger::info("[CoverTex] setPixel done {} / {}", pixDone, kCoverW * kCoverH);
+            RE::GFxValue mat;
+            if (ok) {
+                movie->CreateObject(&mat, "flash.geom.Matrix", nullptr, 0);
+                ok = mat.IsObject();
+            }
+            if (ok) {
+                RE::GFxValue a, d;
+                a.SetNumber(w / static_cast<double>(kCoverW));
+                d.SetNumber(h / static_cast<double>(kCoverH));
+                mat.SetMember("a", a);
+                mat.SetMember("d", d);
+                RE::GFxValue bf[4];
+                bf[0] = bd;
+                bf[1] = mat;
+                bf[2].SetBoolean(false);
+                bf[3].SetBoolean(true);
+                // 级联 1: beginBitmapFill 四参(含 smoothing)
+                bFill = clip.Invoke("beginBitmapFill", nullptr, bf, 4);
+                logger::info("[CoverTex] beginBitmapFill(4 args, smooth) -> {}", bFill ? "ok" : "fail");
+                if (bFill) {
+                    drawQuad(0.0, 0.0, w, h);
+                    style = "bitmap-smooth";
+                }
+                if (!bFill) {
+                    // 级联 2: 三参(不带 smoothing)
+                    bFill = clip.Invoke("beginBitmapFill", nullptr, bf, 3);
+                    logger::info("[CoverTex] beginBitmapFill(3 args) -> {}", bFill ? "ok" : "fail");
+                    if (bFill) {
+                        drawQuad(0.0, 0.0, w, h);
+                        style = "bitmap";
+                    }
+                }
+                if (!bFill) {
+                    // 级联 3: attachBitmap(把位图直接贴到 clip 上,绕过绘制 API)
+                    auto at = std::array{ bd, RE::GFxValue() };
+                    at[1].SetNumber(1.0);
+                    const bool attached = clip.Invoke("attachBitmap", nullptr, at.data(), 2);
+                    logger::info("[CoverTex] attachBitmap -> {}", attached ? "ok" : "fail");
+                    if (attached) {
+                        RE::GFxValue sx, sy;
+                        sx.SetNumber(w / static_cast<double>(kCoverW) * 100.0);
+                        sy.SetNumber(h / static_cast<double>(kCoverH) * 100.0);
+                        clip.SetMember("_xscale", sx);
+                        clip.SetMember("_yscale", sy);
+                        style = "bitmap-attached";
+                        bFill = true;
+                    }
+                }
+            }
+            if (!bFill) {
+                const double cw = w / kCoverW;
+                const double ch = h / kCoverH;
+                int drawn = 0;
+                for (int gy = 0; gy < kCoverH; ++gy) {
+                    for (int gx = 0; gx < kCoverW; ++gx) {
+                        RE::GFxValue col, alp;
+                        col.SetNumber(static_cast<double>(g_coverPx[gy * kCoverW + gx]));
+                        alp.SetNumber(100.0);
+                        auto fa = std::array{ col, alp };
+                        if (!clip.Invoke("beginFill", nullptr, fa.data(), 2)) { continue; }
+                        drawQuad(gx * cw, gy * ch, (gx + 1) * cw, (gy + 1) * ch);
+                        ++drawn;
+                    }
+                }
+                style = "mosaic";
+                bFill = drawn > 0;
+                logger::info("[CoverTex] bitmap path unavailable, fell back to {} mosaic cells", drawn);
+            }
+        } else {
+            RE::GFxValue colour, opacity;
+            colour.SetNumber(1315860.0);
+            opacity.SetNumber(100.0);
+            auto fa = std::array{ colour, opacity };
+            bFill = clip.Invoke("beginFill", nullptr, fa.data(), 2);
+            if (bFill) {
+                drawQuad(0.0, 0.0, w, h);
+            }
+        }
+
+        RE::GFxValue zero; zero.SetNumber(0.0);
+        clip.SetMember("_alpha", zero);
+        RE::GFxValue cx; cx.SetNumber(ox);
+        RE::GFxValue cy; cy.SetNumber(oy);
+        const bool bPos = clip.SetMember("_x", cx) && clip.SetMember("_y", cy);
+
+        g_coverClips.push_back(CoverClip{ clip, movie, a_name });
+        logger::info("[CoverUi] host '{}': clip painted MAGENTA rect origin=({:.0f},{:.0f}) size={:.0f}x{:.0f}  "
+                     "style={} fill={} position={}",
+            a_name, ox, oy, w, h, style, bFill ? "ok" : "FAIL", bPos ? "ok" : "FAIL");
+        return true;
+    }
+
+    void PaintCoverEverywhere()
+    {
+        auto* ui = RE::UI::GetSingleton();
+        if (!ui) {
+            logger::warn("[CoverUi] no UI singleton");
+            return;
+        }
+        g_coverClips.clear();
+        static constexpr const char* kHosts[] = { "HUD Menu", "Cursor Menu", "Loading Menu", "Fader Menu" };
+        for (auto* name : kHosts) {
+            auto menu = ui->GetMenu(name);
+            if (menu) {
+                PaintCoverInto(menu.get(), name);
+            } else {
+                logger::info("[CoverUi] host '{}': menu not found", name);
+            }
+        }
+        if (g_coverClips.empty()) {
+            logger::warn("[CoverUi] no eligible host menu produced a clip");
+        }
+    }
+
+    void SetRuntimeCoverAlpha(float a_alpha01)
+    {
+        auto* ui = RE::UI::GetSingleton();
+        if (!ui) {
+            logger::warn("[CoverUi] no UI singleton");
+            return;
+        }
+        // 崩溃防护:菜单可能被引擎销毁/重建,存下来的 movie 指针会悬空。
+        // 每次按名字重新取菜单,并与缓存的 movie 比对;不一致就重新画。
+        bool stale = g_coverClips.empty();
+        for (const auto& c : g_coverClips) {
+            auto menu = ui->GetMenu(c.host);
+            if (!menu || !menu->uiMovie || menu->uiMovie.get() != c.movie) {
+                stale = true;
+                break;
+            }
+        }
+        if (stale) {
+            PaintCoverEverywhere();
+        }
+
+        RE::GFxValue v;
+        v.SetNumber(static_cast<double>(a_alpha01) * 100.0);
+        int okCount = 0;
+        int readCount = 0;
+        for (auto& c : g_coverClips) {
+            auto menu = ui->GetMenu(c.host);
+            if (!menu || !menu->uiMovie || menu->uiMovie.get() != c.movie) {
+                continue;   // 指针失效:跳过,绝不解引用
+            }
+            if (c.clip.SetMember("_alpha", v)) {
+                ++okCount;
+            }
+            RE::GFxValue back;
+            if (c.movie->GetVariable(&back, "lfCover._alpha") && back.IsNumber() &&
+                std::abs(back.GetNumber() - static_cast<double>(a_alpha01) * 100.0) < 0.5) {
+                ++readCount;
+            }
+        }
+        logger::info("[CoverUi] runtime cover _alpha = {:.0f}: set {}/{}, read-back matched {}/{}",
+            a_alpha01 * 100.0, okCount, g_coverClips.size(), readCount, g_coverClips.size());
+    }
+
+    class CoverMenu final : public RE::IMenu
+    {
+    public:
+        static constexpr std::string_view MENU_NAME = "LoadingFlowCover";
+        static constexpr std::string_view FILE_NAME = "LoadingFlowCover";
+
+        CoverMenu()
+        {
+            menuFlags.set(RE::UI_MENU_FLAGS::kAlwaysOpen,
+                RE::UI_MENU_FLAGS::kAllowSaving,
+                RE::UI_MENU_FLAGS::kAdvancesUnderPauseMenu,
+                RE::UI_MENU_FLAGS::kRendersUnderPauseMenu);
+            depthPriority = 6;   // above HUD, low enough to stay under real menus
+            inputContext = RE::UserEvents::INPUT_CONTEXT_ID::kNone;
+
+            // v1.16.3: 引擎**不会**为 UI::Register 注册的自定义菜单加载 movie(实测 uiMovie 一路 null,
+            // 给 SWF 补 Menu_mc 也没用)。必须自己调 BSScaleformManager::LoadMovie。
+            auto* mgr = RE::BSScaleformManager::GetSingleton();
+            if (!mgr) {
+                logger::warn("[CoverUi] no BSScaleformManager; cannot load the menu movie");
+                return;
+            }
+            const std::string file{ CoverMenu::FILE_NAME };
+            const bool loaded = mgr->LoadMovie(this, uiMovie, file.c_str(),
+                RE::GFxMovieView::ScaleModeType::kShowAll, 0.0f);
+            logger::info("[CoverUi] explicit LoadMovie('{}') -> ok={} uiMovie={}",
+                file, loaded ? "true" : "false", uiMovie ? "SET" : "NULL");
+
+            // v1.16.7: 引擎只在**渲染某个菜单时**才给它的 movie 设 viewport。
+            // 我们这个是自定义菜单,若引擎不渲染它,viewport 就是空的 —— 画什么都落在空处。
+            // 这里按当前后缓冲尺寸自己设一份。
+            if (uiMovie) {
+                std::int32_t vw = 1280, vh = 720;
+                if (auto* sc = static_cast<IDXGISwapChain*>(g_lastSwapChain.load())) {
+                    ID3D11Texture2D* back = nullptr;
+                    if (SUCCEEDED(sc->GetBuffer(presentfreeze::CurrentBackBufferIndex(sc),
+                            __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back))) && back) {
+                        D3D11_TEXTURE2D_DESC d{};
+                        back->GetDesc(&d);
+                        vw = static_cast<std::int32_t>(d.Width);
+                        vh = static_cast<std::int32_t>(d.Height);
+                        back->Release();
+                    }
+                }
+                uiMovie->SetViewport(vw, vh, 0, 0, vw, vh, RE::GViewport::Flag::kNone);
+                logger::info("[CoverUi] viewport set to {}x{}", vw, vh);
+            }
+        }
+
+        static RE::IMenu* Create()
+        {
+            return new CoverMenu();
+        }
+
+        RE::UI_MESSAGE_RESULTS ProcessMessage(RE::UIMessage& a_message) override
+        {
+            // Never swallow anything: this menu exists only to draw.
+            return RE::UI_MESSAGE_RESULTS::kPassOn;
+        }
+    };
+
+    bool g_coverMenuRegistered = false;
+
+    void RegisterCoverMenu()
+    {
+        auto* ui = RE::UI::GetSingleton();
+        if (!ui) {
+            logger::warn("[CoverUi] no UI singleton; cover menu not registered");
+            return;
+        }
+        ui->Register(CoverMenu::MENU_NAME, &CoverMenu::Create);
+        g_coverMenuRegistered = true;
+        logger::info("[CoverUi] registered menu '{}' (movie {}.swf)", CoverMenu::MENU_NAME, CoverMenu::FILE_NAME);
+
+        // v1.13.1:Register() 只是把 create 回调登记进 menuMap,**并不会实例化菜单** —— 所以
+        // GetMenu() 一直返回 null、movie 永远拿不到(这就是 v1.13.0 "movie not available yet" 的原因)。
+        // 必须通过 UI 消息队列发一条 kShow,引擎才会真正 create 菜单并加载 Interface/<name>.swf。
+        auto* queue = RE::UIMessageQueue::GetSingleton();
+        if (queue) {
+            queue->AddMessage(RE::BSFixedString(CoverMenu::MENU_NAME.data()), RE::UI_MESSAGE_TYPE::kShow, nullptr);
+            logger::info("[CoverUi] pushed kShow to instantiate the menu");
+        } else {
+            logger::warn("[CoverUi] no UIMessageQueue; cannot instantiate the menu");
+        }
+    }
+
+    // alpha01: 0 = hidden, 1 = fully covering. Uses kPermanent so the value sticks even if the movie
+    // has not finished loading yet.
+    void SetCoverAlpha(float a_alpha01)
+    {
+        if (!g_coverMenuRegistered) {
+            return;
+        }
+        auto* ui = RE::UI::GetSingleton();
+        if (!ui) {
+            return;
+        }
+        auto menu = ui->GetMenu(CoverMenu::MENU_NAME);
+        if (!menu) {
+            logger::warn("[CoverUi] menu object is null (kShow not processed yet?); alpha {} not applied", a_alpha01);
+            return;
+        }
+        if (!menu->uiMovie) {
+            // 菜单实例存在但没有 movie ⇒ 引擎没能加载 Interface/<name>.swf(文件缺失 / SWF 无法解析)
+            logger::warn("[CoverUi] menu exists but uiMovie is NULL -> engine did not load Interface/{}.swf; alpha {} not applied",
+                CoverMenu::FILE_NAME, a_alpha01);
+            return;
+        }
+        RE::GFxValue v;
+        v.SetNumber(static_cast<double>(a_alpha01) * 100.0);
+
+        // v1.16.4: SetVariable 的点路径一直 miss(虽然 uiMovie 已经 SET),所以改成
+        //   "先把 clip 取成对象句柄 -> 再 SetMember 改属性",并对候选路径逐个探测打日志。
+        static RE::GFxValue s_clip;
+        static const char*  s_clipPath = "";
+        if (!s_clip.IsDisplayObject()) {
+            static constexpr const char* kCandidates[] = {
+                "Menu_mc.cover", "cover", "_root.Menu_mc.cover", "Menu_mc"
+            };
+            for (auto* path : kCandidates) {
+                RE::GFxValue probe;
+                const bool got = menu->uiMovie->GetVariable(&probe, path);
+                const int ty = static_cast<int>(probe.GetType());
+                const bool disp = probe.IsDisplayObject();
+                const bool obj = probe.IsObject();
+                logger::info("[CoverUi] probe '{}': got={} type={} obj={} display={}",
+                    path, got ? "y" : "n", ty, obj ? "y" : "n", disp ? "y" : "n");
+                if (got && disp) {
+                    s_clip = probe;
+                    s_clipPath = path;
+                    break;
+                }
+            }
+        }
+
+        if (s_clip.IsDisplayObject()) {
+            // v1.16.6: SWF 里那个子级 cover 在运行时没有实例化(实测 Menu_mc.cover got=n),
+            // 所以改成"拿到 Menu_mc 句柄后自己往里画"。绘制原语(beginFill/moveTo/lineTo/endFill)
+            // 在 Loading Menu 上已经验证过能真正上屏,这里复用同一套。
+            static bool s_drawn = false;
+            if (!s_drawn) {
+                RE::GFxValue col, alp;
+                col.SetNumber(1315860.0);   // 0x141414 深灰(先用它验"能不能盖住",之后换磨玻璃纹理)
+                alp.SetNumber(100.0);
+                auto fa = std::array{ col, alp };
+                const bool bFill = s_clip.Invoke("beginFill", nullptr, fa.data(), 2);
+                auto mv = std::array{ RE::GFxValue(), RE::GFxValue() };
+                mv[0].SetNumber(0.0); mv[1].SetNumber(0.0);
+                s_clip.Invoke("moveTo", nullptr, mv.data(), 2);
+                const double pts[3][2] = { { 1920.0, 0.0 }, { 1920.0, 1080.0 }, { 0.0, 1080.0 } };
+                bool bLine = true;
+                for (const auto& pt : pts) {
+                    auto ln = std::array{ RE::GFxValue(), RE::GFxValue() };
+                    ln[0].SetNumber(pt[0]); ln[1].SetNumber(pt[1]);
+                    bLine = s_clip.Invoke("lineTo", nullptr, ln.data(), 2) && bLine;
+                }
+                static const auto kEnd = std::array<RE::GFxValue, 1>{};
+                const bool bEnd = s_clip.Invoke("endFill", nullptr, kEnd.data(), 0);
+                s_drawn = true;
+                logger::info("[CoverUi] drew cover rect into '{}'  fill={} line={} end={}",
+                    s_clipPath, bFill ? "ok" : "FAIL", bLine ? "ok" : "FAIL", bEnd ? "ok" : "FAIL");
+            }
+            const bool ok = s_clip.SetMember("_alpha", v);
+            auto* ui2 = RE::UI::GetSingleton();
+            const bool open = ui2 ? ui2->IsMenuOpen(CoverMenu::MENU_NAME) : false;
+            logger::info("[CoverUi] alpha={:.0f} via clip '{}' -> {}   menuOpen={}",
+                a_alpha01 * 100.0, s_clipPath, ok ? "set" : "FAIL", open ? "y" : "N");
+            return;
+        }
+
+        // 没有拿到句柄时保留旧的路径写法作为最后兜底
+        const bool okNested = menu->uiMovie->SetVariable("Menu_mc.cover._alpha", v,
+            RE::GFxMovie::SetVarType::kPermanent);
+        const bool okFlat = menu->uiMovie->SetVariable("cover._alpha", v,
+            RE::GFxMovie::SetVarType::kPermanent);
+        logger::info("[CoverUi] alpha={:.0f}  NO CLIP HANDLE; path SetVariable: Menu_mc.cover={} cover={}",
+            a_alpha01 * 100.0, okNested ? "set" : "miss", okFlat ? "set" : "miss");
+    }
+    // ================================================================================
+
     void OnMessage(SKSE::MessagingInterface::Message* a_msg)
     {        if (!a_msg) {
             return;
@@ -5336,8 +7741,12 @@ namespace
             logger::info("kDataLoaded: initializing LoadingFlow hooks & auto-verifying blueprint index");
             EnsureBlueprintsLoaded(false);
             ResolveExcludedCells();
+            LoadCellTimesOnce();
             CacheForms();
             InstallVtableHooks(g_config.usePocketCopies);
+            if (g_config.coverTest == 2) {
+                RegisterCoverMenu();
+            }
             LogGraphicsEnvironment();
             if (g_config.probeGfx) {
                 ProbeDumpGfxOnce();
@@ -5404,7 +7813,7 @@ namespace
 }
 
 SKSEPluginInfo(
-    .Version = REL::Version{ 1, 2, 0, 0 },
+    .Version = REL::Version{ 1, 3, 5, 0 },
     .Name = "LoadingFlow"sv,
     .Author = "RandyLua"sv,
     .SupportEmail = ""sv,
@@ -5415,6 +7824,7 @@ SKSEPluginInfo(
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
     SKSE::Init(a_skse);
+    std::atexit([]() { g_shuttingDown.store(true, std::memory_order_release); });
 
     auto path = logger::log_directory();
     if (!path) {
@@ -5433,7 +7843,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
     // the mode the game is actually running in.
     LoadConfig();
 
-    logger::info("LoadingFlow v1.2.0 loading... [MODE: real transitions | hooks: door + LoadingMenu{} | "
+    logger::info("LoadingFlow v" LOADINGFLOW_BANNER " loading... [MODE: real transitions | hooks: door + LoadingMenu{} | "
                  "suppression {} (re-post after {} ms inside a {} ms window) | GLOBAL suppression {} | prewarm {} | "
                  "no-black {} (manual {}, walk-through {}) | cut mask 0x{:08X}/{} ms | freeze delay {} ms | "
                  "envelope {} ({} ms) | pocket copies {} | void overlay {} ({} motes, {} ms pulse)]",
@@ -5454,7 +7864,6 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
         g_config.voidOverlay ? "ON" : "off",
         g_config.overlayMotes,
         g_config.overlayPulseMs);
-
     if (auto* messaging = SKSE::GetMessagingInterface()) {
         messaging->RegisterListener(OnMessage);
     }

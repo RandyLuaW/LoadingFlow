@@ -5,6 +5,45 @@ The project was called **PocketCell** until v1.0.0; that name is retired.
 
 ---
 
+## [1.3.5] — 2026-11-27
+
+### Fixed
+
+- The transition watchdog now follows the adaptive cell-load window instead of expiring after a fixed 15 seconds, and cleans up its state when the watch ends.
+- Saving the menu no longer pins an automatically managed transition window into the INI. An explicitly configured `uTransitionWindowMs` is still respected.
+- Raised the transition-window and timeout limit to 60 seconds and aligned the menu slider with the range accepted by the configuration loader.
+- Restored nine settings that the menu could read but did not write back, including `bGlobalMenuSuppression`; configuration loading and saving now cover the same 90 keys.
+- Cell-load history saves now use generation-based debouncing and atomic file replacement, with interruptible shutdown handling.
+- Corrected a startup log message that reported the suppression timeout as the transition window.
+
+### Verification
+
+- Two real door transitions on SE 1.5.97 completed normally in 4124 ms and 3223 ms, with loading-menu suppression, adaptive-window updates and state release all recorded in the log. No timeout or fallback occurred.
+- The AE 1.7.x build remains experimental and has not been verified in game.
+
+---
+
+## [1.3.4] — 2026-11-09
+
+### Fixed
+
+- Slow cells are no longer given up on after a fixed ten-second wait. The transition window adapts to the previous load time for each cell, clamped to 8–60 seconds.
+- Cell-load times are remembered between sessions in `LoadingFlow_CellTimes.ini`; this file is safe to delete and affects only the wait limit.
+- The fallback checks whether the transition has already completed before re-posting the loading menu.
+
+---
+
+## [1.3.3] — 2026-11-08
+
+### Fixed
+
+- Validate graphics-wrapper function pointers before installing hooks; if validation fails, leave that swap chain completely unhooked.
+- Do not call `Present1` on bitblt swap chains or pass it a null parameter block.
+- `uHoldAtCutMs=0` now genuinely disables the cut freeze.
+- Menu controls use debounced configuration writes instead of rewriting the file on every click.
+
+---
+
 ## [1.2.0] — 2026-11-05
 
 ### Fixed
